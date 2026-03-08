@@ -7,6 +7,14 @@
 // JSON-RPC 2.0 Base Types
 // ============================================================================
 
+// AgentInfo 类型定义
+export interface AgentInfo {
+  agentId: string;
+  agentIndex?: number;
+  taskId?: string;
+  timestamp?: number;
+}
+
 export interface JsonRpcRequest {
   jsonrpc: '2.0';
   id: string | number;
@@ -42,6 +50,8 @@ export const ACP_METHODS = {
   SESSION_LOAD: 'session/load',  // iflow cli uses session/load
   SESSION_PROMPT: 'session/prompt',
   SESSION_SET_MODE: 'session/set_mode',
+  SESSION_SET_CONFIG_OPTION: 'session/set_config_option',  // ACP 标准方法，用于设置 model、deepThinking 等
+  // 以下方法在 ACP 协议中不存在，保留用于本地状态管理
   SESSION_SET_MODEL: 'session/set_model',
   SESSION_SET_DEEP_THINKING: 'session/set_deep_thinking',
 } as const;
@@ -142,6 +152,7 @@ export interface AcpSetModelResult {
   success: boolean;
   previousModel: string;
   currentModel: string;
+  serverSynced: boolean;
 }
 
 export interface AcpSetDeepThinkingParams {
@@ -153,6 +164,7 @@ export interface AcpSetDeepThinkingResult {
   success: boolean;
   enabled: boolean;
   level: number;
+  serverSynced?: boolean;
 }
 
 // ============================================================================
@@ -177,6 +189,7 @@ export interface AgentMessageChunkUpdate extends BaseSessionUpdate {
       mimeType?: string;
       uri?: string;
     };
+    agentInfo?: AgentInfo;  // 添加 agentInfo 字段
   };
 }
 
@@ -218,6 +231,7 @@ export interface ToolCallUpdate extends BaseSessionUpdate {
     rawInput?: Record<string, unknown>;
     content?: ToolCallContentItem[];
     locations?: ToolCallLocationItem[];
+    agentInfo?: AgentInfo;  // 添加 agentInfo 字段
   };
 }
 
@@ -342,6 +356,7 @@ export interface AcpConfigSelectOption {
 export interface AgentMessageChunkData {
   content: string;
   isComplete: boolean;
+  agentInfo?: AgentInfo;  // 添加 agentInfo 字段
 }
 
 export interface AgentThoughtChunkData {
@@ -353,6 +368,7 @@ export interface ToolCallData {
   toolId: string;
   toolName: string;
   arguments: Record<string, unknown>;
+  agentInfo?: AgentInfo;  // 添加 agentInfo 字段
 }
 
 export interface ToolResultData {
@@ -424,7 +440,7 @@ export type AcpConnectionState =
   | 'error';
 
 export interface AcpConnectionOptions {
-  command: string;
+  command?: string;
   args?: string[];
   cwd?: string;
   env?: Record<string, string>;

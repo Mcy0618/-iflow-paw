@@ -1,209 +1,48 @@
-import React, { useMemo } from 'react'
-import ReactMarkdown from 'react-markdown'
-import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter/dist/cjs'
-import { oneDark } from 'react-syntax-highlighter/dist/cjs/styles/prism'
-import remarkGfm from 'remark-gfm'
+import React, { useState, useMemo, useCallback } from 'react'
+import { UserIcon, CpuChipIcon, TrashIcon, ArrowPathIcon, ClipboardIcon, CheckIcon } from '@heroicons/react/24/outline'
+import { useTheme } from '../../hooks/useTheme'
 import { Message as MessageType } from '../../store/useAppStore'
-import { UserIcon, CpuChipIcon, ClipboardIcon, CheckIcon } from '@heroicons/react/24/outline'
+import { MarkdownRenderer } from './MarkdownRenderer'
+import { ThinkingBlock } from './ThinkingBlock'
+import { TabSwitcher } from './TabSwitcher'
+import { StreamingIndicator } from './StreamingIndicator'
 
 interface MessageProps {
   message: MessageType
   isLast?: boolean
+  sessionId?: string
+  onDelete?: (messageId: string) => void
+  onRegenerate?: (messageId: string) => void
+  isRegenerating?: boolean
+  onCopy?: () => void
 }
 
-// 代码块组件
-interface CodeBlockProps {
-  language: string
-  code: string
-}
-
-const CodeBlock: React.FC<CodeBlockProps> = ({ language, code }) => {
-  const [copied, setCopied] = React.useState(false)
-
-  const handleCopy = async () => {
-    try {
-      await navigator.clipboard.writeText(code)
-      setCopied(true)
-      setTimeout(() => setCopied(false), 2000)
-    } catch (err) {
-      console.error('Failed to copy:', err)
-    }
-  }
-
-  return (
-    <div className="relative group rounded-lg overflow-hidden my-3">
-      {/* 代码块头部 */}
-      <div className="flex items-center justify-between px-4 py-2 bg-gray-800 text-gray-400 text-xs">
-        <span className="font-mono">{language || 'text'}</span>
-        <button
-          onClick={handleCopy}
-          className="flex items-center gap-1.5 hover:text-white transition-colors"
-        >
-          {copied ? (
-            <>
-              <CheckIcon className="w-3.5 h-3.5" />
-              已复制
-            </>
-          ) : (
-            <>
-              <ClipboardIcon className="w-3.5 h-3.5" />
-              复制
-            </>
-          )}
-        </button>
-      </div>
-      
-      {/* 代码内容 */}
-      <SyntaxHighlighter
-        language={language || 'text'}
-        style={oneDark}
-        customStyle={{
-          margin: 0,
-          padding: '1rem',
-          fontSize: '0.85rem',
-          lineHeight: '1.6',
-          background: '#1F2937',
-        }}
-        showLineNumbers={code.split('\n').length > 5}
-        lineNumberStyle={{
-          minWidth: '2.5em',
-          paddingRight: '1em',
-          color: '#6B7280',
-          textAlign: 'right',
-        }}
-      >
-        {code}
-      </SyntaxHighlighter>
-    </div>
-  )
-}
-
-// Markdown 渲染组件
-interface MarkdownRendererProps {
-  content: string
-}
-
-const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({ content }) => {
-  return (
-    <ReactMarkdown
-      remarkPlugins={[remarkGfm]}
-      components={{
-        // 代码块
-        code({ node, inline, className, children, ...props }) {
-          const match = /language-(\w+)/.exec(className || '')
-          const language = match ? match[1] : ''
-          const code = String(children).replace(/\n$/, '')
-          
-          if (!inline && code) {
-            return <CodeBlock language={language} code={code} />
-          }
-          
-          return (
-            <code
-              className="px-1.5 py-0.5 bg-gray-100 text-primary-700 rounded text-sm font-mono"
-              {...props}
-            >
-              {children}
-            </code>
-          )
-        },
-        
-        // 段落
-        p({ children }) {
-          return <p className="mb-3 last:mb-0">{children}</p>
-        },
-        
-        // 列表
-        ul({ children }) {
-          return <ul className="list-disc pl-5 mb-3 space-y-1">{children}</ul>
-        },
-        
-        ol({ children }) {
-          return <ol className="list-decimal pl-5 mb-3 space-y-1">{children}</ol>
-        },
-        
-        // 引用块
-        blockquote({ children }) {
-          return (
-            <blockquote className="border-l-4 border-primary-400 bg-primary-50/50 pl-4 py-2 my-3 text-gray-600">
-              {children}
-            </blockquote>
-          )
-        },
-        
-        // 链接
-        a({ href, children }) {
-          return (
-            <a
-              href={href}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-primary-600 hover:text-primary-700 underline"
-            >
-              {children}
-            </a>
-          )
-        },
-        
-        // 表格
-        table({ children }) {
-          return (
-            <div className="overflow-x-auto my-3">
-              <table className="min-w-full border-collapse border border-gray-200 text-sm">
-                {children}
-              </table>
-            </div>
-          )
-        },
-        
-        thead({ children }) {
-          return <thead className="bg-gray-50">{children}</thead>
-        },
-        
-        th({ children }) {
-          return (
-            <th className="border border-gray-200 px-3 py-2 text-left font-semibold text-gray-700">
-              {children}
-            </th>
-          )
-        },
-        
-        td({ children }) {
-          return (
-            <td className="border border-gray-200 px-3 py-2 text-gray-600">
-              {children}
-            </td>
-          )
-        },
-        
-        // 分隔线
-        hr() {
-          return <hr className="my-4 border-gray-200" />
-        },
-        
-        // 标题
-        h1({ children }) {
-          return <h1 className="text-xl font-bold mt-6 mb-3">{children}</h1>
-        },
-        
-        h2({ children }) {
-          return <h2 className="text-lg font-bold mt-5 mb-2">{children}</h2>
-        },
-        
-        h3({ children }) {
-          return <h3 className="text-base font-bold mt-4 mb-2">{children}</h3>
-        },
-      }}
-    >
-      {content}
-    </ReactMarkdown>
-  )
-}
-
-// 主消息组件
-export const Message: React.FC<MessageProps> = ({ message, isLast }) => {
+/**
+ * 主消息组件 - 负责消息的整体布局和状态管理
+ */
+export const Message: React.FC<MessageProps> = React.memo(({ 
+  message, 
+  isLast: _isLast,
+  sessionId: _sessionId,
+  onDelete,
+  onRegenerate,
+  isRegenerating = false,
+  onCopy
+}) => {
   const isUser = message.role === 'user'
   const isStreaming = message.isStreaming
+  const hasThoughts = !!message.thoughts
+  const hasContent = !!message.content
+  const { isDark } = useTheme()
+  
+  // 标签切换状态：默认显示输出
+  const [activeTab, setActiveTab] = useState<'thinking' | 'output'>('thinking')
+  
+  // 操作按钮显示状态
+  const [showActions, setShowActions] = useState(false)
+  
+  // 复制状态
+  const [copied, setCopied] = useState(false)
   
   // 格式化时间
   const formattedTime = useMemo(() => {
@@ -212,25 +51,109 @@ export const Message: React.FC<MessageProps> = ({ message, isLast }) => {
       minute: '2-digit',
     })
   }, [message.timestamp])
+  
+  // 处理复制
+  const handleCopy = useCallback(async () => {
+    const contentToCopy = message.thoughts 
+      ? `【思考过程】\n${message.thoughts}\n\n【回复内容】\n${message.content}`
+      : message.content
+    
+    try {
+      await navigator.clipboard.writeText(contentToCopy)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+      if (onCopy) onCopy()
+    } catch (err) {
+      console.error('Failed to copy message:', err)
+    }
+  }, [message.content, message.thoughts, onCopy])
+  
+  // 处理删除
+  const handleDelete = useCallback(() => {
+    if (onDelete && !isStreaming) {
+      onDelete(message.id)
+    }
+  }, [message.id, onDelete, isStreaming])
+  
+  // 处理重新生成
+  const handleRegenerate = useCallback(() => {
+    if (onRegenerate && !isStreaming && !isRegenerating) {
+      onRegenerate(message.id)
+    }
+  }, [message.id, onRegenerate, isStreaming, isRegenerating])
 
+  // 用户消息 - 右侧显示
   if (isUser) {
-    // 用户消息 - 右侧显示
     return (
-      <div className="flex justify-end animate-fade-in">
+      <div 
+        className="flex justify-end animate-fade-in group"
+        onMouseEnter={() => setShowActions(true)}
+        onMouseLeave={() => setShowActions(false)}
+      >
         <div className="flex items-start gap-3 max-w-[80%]">
           <div className="flex flex-col items-end">
-            <div className="px-4 py-3 bg-primary-50 text-gray-800 rounded-2xl rounded-tr-sm border border-primary-100">
-              <div className="whitespace-pre-wrap leading-relaxed">
+            <div className="px-5 py-3.5 bg-gradient-to-br from-primary-500 to-primary-600 
+              text-white rounded-2xl rounded-tr-md shadow-lg shadow-primary-200 dark:shadow-primary-900/30
+              relative overflow-hidden">
+              {/* 边框光效 */}
+              <div className="absolute inset-0 rounded-2xl rounded-tr-md opacity-50 pointer-events-none"
+                style={{
+                  background: 'linear-gradient(135deg, rgba(255,255,255,0.2) 0%, transparent 50%, rgba(255,255,255,0.1) 100%)',
+                }}
+              />
+              <div className="whitespace-pre-wrap leading-relaxed text-[15px] relative z-10">
                 {message.content}
               </div>
             </div>
-            <span className="text-xs text-gray-400 mt-1.5 mr-1">
-              {formattedTime}
-            </span>
+            <div className="flex items-center gap-2 mt-2 mr-1">
+              <span className={`text-xs font-medium ${
+                isDark ? 'text-slate-500' : 'text-slate-400'
+              }`}>
+                {formattedTime}
+              </span>
+              {/* 操作按钮 */}
+              {showActions && !isStreaming && (
+                <div className="flex items-center gap-1">
+                  {/* 复制按钮 */}
+                  <button
+                    onClick={handleCopy}
+                    className={`p-1 rounded transition-colors ${
+                      copied
+                        ? 'text-green-500'
+                        : isDark 
+                          ? 'text-slate-500 hover:text-slate-300 hover:bg-slate-700' 
+                          : 'text-slate-400 hover:text-slate-600 hover:bg-slate-100'
+                    }`}
+                    title={copied ? '已复制' : '复制内容'}
+                  >
+                    {copied ? (
+                      <CheckIcon className="w-3.5 h-3.5" />
+                    ) : (
+                      <ClipboardIcon className="w-3.5 h-3.5" />
+                    )}
+                  </button>
+                  {/* 删除按钮 */}
+                  {onDelete && (
+                    <button
+                      onClick={handleDelete}
+                      className={`p-1 rounded transition-colors ${
+                        isDark 
+                          ? 'text-slate-500 hover:text-red-400 hover:bg-slate-700' 
+                          : 'text-slate-400 hover:text-red-500 hover:bg-slate-100'
+                      }`}
+                      title="删除消息"
+                    >
+                      <TrashIcon className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
           </div>
           
           {/* 用户头像 */}
-          <div className="flex-shrink-0 w-8 h-8 bg-primary-500 rounded-full flex items-center justify-center">
+          <div className="flex-shrink-0 w-9 h-9 bg-gradient-to-br from-slate-600 to-slate-700 
+            rounded-full flex items-center justify-center shadow-md">
             <UserIcon className="w-4 h-4 text-white" />
           </div>
         </div>
@@ -240,42 +163,154 @@ export const Message: React.FC<MessageProps> = ({ message, isLast }) => {
 
   // AI 消息 - 左侧显示
   return (
-    <div className="flex justify-start animate-fade-in">
+    <div 
+      className="flex justify-start animate-fade-in group"
+      onMouseEnter={() => setShowActions(true)}
+      onMouseLeave={() => setShowActions(false)}
+    >
       <div className="flex items-start gap-3 max-w-[85%]">
         {/* AI 头像 */}
-        <div className="flex-shrink-0 w-8 h-8 bg-gradient-to-br from-primary-400 to-primary-600 rounded-full flex items-center justify-center shadow-sm">
+        <div className="flex-shrink-0 w-9 h-9 bg-gradient-to-br from-primary-500 via-purple-500 
+          to-purple-600 rounded-full flex items-center justify-center shadow-md shadow-purple-200 dark:shadow-purple-900/30">
           <CpuChipIcon className="w-4 h-4 text-white" />
         </div>
         
         <div className="flex flex-col">
-          <div className="px-4 py-3 bg-white rounded-2xl rounded-tl-sm border border-gray-200 shadow-sm">
-            {message.content ? (
-              <div className="markdown-content text-gray-800">
+          <div className={`px-5 py-3.5 backdrop-blur-sm rounded-2xl rounded-tl-md 
+            shadow-sm relative overflow-hidden ${
+            isDark 
+              ? 'bg-slate-800/90 border border-slate-700/50 shadow-slate-900/20' 
+              : 'bg-white/90 border border-slate-200/60 shadow-slate-200/50'
+          }`}>
+            {/* 边框光效动画 */}
+            <div className="absolute inset-0 rounded-2xl rounded-tl-md pointer-events-none overflow-hidden">
+              <div className="absolute inset-0 animate-shimmer opacity-30"
+                style={{
+                  background: isDark 
+                    ? 'linear-gradient(90deg, transparent 0%, rgba(99,102,241,0.3) 50%, transparent 100%)'
+                    : 'linear-gradient(90deg, transparent 0%, rgba(99,102,241,0.2) 50%, transparent 100%)',
+                  backgroundSize: '200% 100%',
+                }}
+              />
+            </div>
+            
+            {/* 标签切换 */}
+            <TabSwitcher
+              activeTab={activeTab}
+              onTabChange={setActiveTab}
+              hasThoughts={hasThoughts}
+              hasContent={hasContent}
+              isThinking={message.isThinking}
+            />
+            
+            {/* 思考内容 */}
+            {(activeTab === 'thinking' || !hasContent) && hasThoughts && (
+              <ThinkingBlock thoughts={message.thoughts!} isThinking={message.isThinking} />
+            )}
+            
+            {/* 输出内容 */}
+            {(activeTab === 'output' || !hasThoughts) && hasContent ? (
+              <div className={`markdown-content relative z-10 ${
+                isDark ? 'text-slate-200' : 'text-slate-800'
+              }`}>
                 <MarkdownRenderer content={message.content} />
               </div>
             ) : isStreaming ? (
-              // 流式加载中
-              <div className="flex items-center gap-2 py-2">
-                <span className="w-2 h-2 bg-primary-400 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
-                <span className="w-2 h-2 bg-primary-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
-                <span className="w-2 h-2 bg-primary-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
-              </div>
+              <StreamingIndicator hasThoughts={hasThoughts} />
             ) : null}
           </div>
           
-          <div className="flex items-center gap-2 mt-1.5 ml-1">
-            <span className="text-xs text-gray-400">
+          <div className="flex items-center gap-2 mt-2 ml-1">
+            <span className={`text-xs font-medium ${
+              isDark ? 'text-slate-500' : 'text-slate-400'
+            }`}>
               {formattedTime}
             </span>
             {isStreaming && (
-              <span className="text-xs text-primary-500 flex items-center gap-1">
-                <span className="w-1 h-1 bg-primary-500 rounded-full animate-pulse" />
+              <span className="text-xs text-primary-500 dark:text-primary-400 flex items-center gap-1.5 font-medium">
+                <span className="w-1.5 h-1.5 bg-primary-500 rounded-full animate-pulse" />
                 生成中
               </span>
+            )}
+            {/* 操作按钮 */}
+            {!isStreaming && showActions && (
+              <div className="flex items-center gap-1">
+                {/* 复制按钮 */}
+                <button
+                  onClick={handleCopy}
+                  className={`p-1 rounded transition-colors ${
+                    copied
+                      ? 'text-green-500'
+                      : isDark 
+                        ? 'text-slate-500 hover:text-slate-300 hover:bg-slate-700' 
+                        : 'text-slate-400 hover:text-slate-600 hover:bg-slate-100'
+                  }`}
+                  title={copied ? '已复制' : '复制内容'}
+                >
+                  {copied ? (
+                    <CheckIcon className="w-3.5 h-3.5" />
+                  ) : (
+                    <ClipboardIcon className="w-3.5 h-3.5" />
+                  )}
+                </button>
+                {/* 重新生成按钮 */}
+                {onRegenerate && (
+                  <button
+                    onClick={handleRegenerate}
+                    disabled={isRegenerating}
+                    className={`p-1 rounded transition-colors ${
+                      isRegenerating 
+                        ? 'text-primary-400 cursor-wait' 
+                        : isDark 
+                          ? 'text-slate-500 hover:text-primary-400 hover:bg-slate-700' 
+                          : 'text-slate-400 hover:text-primary-500 hover:bg-slate-100'
+                    }`}
+                    title={isRegenerating ? '正在重新生成...' : '重新生成'}
+                  >
+                    <ArrowPathIcon className={`w-3.5 h-3.5 ${isRegenerating ? 'animate-spin' : ''}`} />
+                  </button>
+                )}
+                {/* 删除按钮 */}
+                {onDelete && (
+                  <button
+                    onClick={handleDelete}
+                    className={`p-1 rounded transition-colors ${
+                      isDark 
+                        ? 'text-slate-500 hover:text-red-400 hover:bg-slate-700' 
+                        : 'text-slate-400 hover:text-red-500 hover:bg-slate-100'
+                    }`}
+                    title="删除消息"
+                  >
+                    <TrashIcon className="w-3.5 h-3.5" />
+                  </button>
+                )}
+              </div>
             )}
           </div>
         </div>
       </div>
     </div>
   )
-}
+}, (prevProps, nextProps) => {
+  // 自定义比较函数：只有当这些关键属性变化时才重新渲染
+  return (
+    prevProps.message.id === nextProps.message.id &&
+    prevProps.message.content === nextProps.message.content &&
+    prevProps.message.isStreaming === nextProps.message.isStreaming &&
+    prevProps.message.thoughts === nextProps.message.thoughts &&
+    prevProps.message.isThinking === nextProps.message.isThinking &&
+    prevProps.message.timestamp === nextProps.message.timestamp &&
+    prevProps.isLast === nextProps.isLast &&
+    prevProps.isRegenerating === nextProps.isRegenerating &&
+    prevProps.onDelete === nextProps.onDelete &&
+    prevProps.onRegenerate === nextProps.onRegenerate
+  )
+})
+
+// 导出子组件供外部使用
+export { CodeBlock } from './CodeBlock'
+export { MarkdownRenderer } from './MarkdownRenderer'
+export { ThinkingBlock } from './ThinkingBlock'
+export { MessageHeader } from './MessageHeader'
+export { TabSwitcher } from './TabSwitcher'
+export { StreamingIndicator } from './StreamingIndicator'

@@ -30,6 +30,9 @@ export interface Message {
     model?: string;
     tokens?: number;
     finishReason?: string;
+    toolId?: string;
+    toolName?: string;
+    arguments?: unknown;
   };
 }
 
@@ -244,7 +247,7 @@ export class SessionStore {
   /**
    * Add a message to a session
    */
-  addMessage(sessionId: string, message: Omit<Message, 'id' | 'timestamp'>): Session | null {
+  addMessage(sessionId: string, message: Omit<Message, 'id' | 'timestamp'> & { id?: string }): Session | null {
     const session = this.loadSession(sessionId);
     if (!session) {
       return null;
@@ -252,7 +255,7 @@ export class SessionStore {
 
     const newMessage: Message = {
       ...message,
-      id: uuidv4(),
+      id: message.id || uuidv4(), // 使用传入的 ID 或生成新的
       timestamp: new Date().toISOString(),
     };
 

@@ -1,5 +1,5 @@
 import { useCallback, useMemo } from 'react'
-import { useAppStore, Session, Message } from '../store/useAppStore'
+import { useAppStore, Session } from '../store/useAppStore'
 import { v4 as uuidv4 } from 'uuid'
 
 interface UseSessionsReturn {
@@ -37,6 +37,7 @@ export function useSessions(): UseSessionsReturn {
     setCurrentSessionId,
     updateSession,
     setSessions,
+    addToast,
   } = useAppStore()
 
   // 获取当前会话
@@ -56,24 +57,60 @@ export function useSessions(): UseSessionsReturn {
       model: settings.defaultModel,
       mode: settings.defaultMode,
       deepThinking: settings.deepThinking,
+      workingDir: settings.workspacePath || '', // 使用全局工作区路径作为默认值
     }
     
     addSession(newSession)
+    addToast({ type: 'success', message: '新会话已创建' })
     return newSession
-  }, [settings, addSession])
+  }, [settings, addSession, addToast])
 
   // 删除会话
   const deleteSession = useCallback((id: string) => {
     storeDeleteSession(id)
-  }, [storeDeleteSession])
+    addToast({ type: 'info', message: '会话已删除' })
+  }, [storeDeleteSession, addToast])
 
   // 切换会话
-  const switchSession = useCallback((id: string) => {
+  const switchSession = useCallback(async (id: string) => {
     const session = sessions.find(s => s.id === id)
     if (session) {
       setCurrentSessionId(id)
+      
+      // 使用会话保存的设置，如果没有则使用全局设置
+      const sessionModel = session.model || settings.defaultModel
+      const sessionMode = session.mode || settings.defaultMode
+      const sessionDeepThinking = session.deepThinking ?? settings.deepThinking
+      
+      // 同步到全局设置，确保 UI 显示正确
+      useAppStore.getState().updateSettings({
+        defaultModel: sessionModel,
+        defaultMode: sessionMode,
+        deepThinking: sessionDeepThinking,
+        workspacePath: session.workingDir || settings.workspacePath,
+      })
+      
+      // 通知主进程加载会话，同步工作区和设置
+      if (typeof window !== 'undefined' && window.electronAPI?.session?.load) {
+        try {
+          await window.electronAPI.session.load(
+            id,
+            session.title,
+            session.workingDir,
+            {
+              model: sessionModel,
+              mode: sessionMode,
+              deepThinking: sessionDeepThinking,
+            }
+          )
+          console.log('[Session] Switched session and synced with main process:', id)
+        } catch (error) {
+          console.error('[Session] Failed to sync session with main process:', error)
+          addToast({ type: 'error', message: '会话切换同步失败', duration: 3000 })
+        }
+      }
     }
-  }, [sessions, setCurrentSessionId])
+  }, [sessions, setCurrentSessionId, settings, addToast])
 
   // 更新会话标题
   const updateSessionTitle = useCallback((id: string, title: string) => {
@@ -81,7 +118,7 @@ export function useSessions(): UseSessionsReturn {
   }, [updateSession])
 
   // 更新会话设置
-  const updateSessionSettings = useCallback((id: string, sessionSettings: Partial<Pick<Session, 'model' | 'mode' | 'deepThinking'>>) => {
+  const updateSessionSettings = useCallback((id: string, sessionSettings: Partial<Pick<Session, 'model' | 'mode' | 'deepThinking' | 'workingDir'>>) => {
     updateSession(id, sessionSettings)
   }, [updateSession])
 
@@ -90,8 +127,9 @@ export function useSessions(): UseSessionsReturn {
     if (confirm('确定要删除所有会话吗？此操作不可恢复。')) {
       setSessions([])
       setCurrentSessionId(null)
+      addToast({ type: 'info', message: '所有会话已清空' })
     }
-  }, [setSessions, setCurrentSessionId])
+  }, [setSessions, setCurrentSessionId, addToast])
 
   // 自动生成会话标题
   const generateSessionTitle = useCallback((sessionId: string) => {

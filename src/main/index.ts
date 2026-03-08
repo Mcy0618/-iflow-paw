@@ -2,6 +2,7 @@ import { app, shell, BrowserWindow, ipcMain, dialog } from 'electron'
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { registerIpcHandlers, unregisterIpcHandlers } from './ipc/handlers'
+import { getProviderManager, resetProviderManager } from './providers/provider-manager'
 
 // 保持窗口全局引用，防止被垃圾回收
 let mainWindow: BrowserWindow | null = null
@@ -16,6 +17,7 @@ function createWindow(): void {
     show: false,
     autoHideMenuBar: true,
     titleBarStyle: 'default',
+    icon: join(__dirname, '../../resources/logo.svg'),
     ...(process.platform === 'linux' ? {} : {}),
     webPreferences: {
       preload: join(__dirname, '../preload/index.mjs'),
@@ -76,6 +78,62 @@ app.whenReady().then(() => {
     return result.canceled ? null : result.filePaths[0]
   })
 
+  // 选择图片文件
+  ipcMain.handle('select-image', async () => {
+    if (!mainWindow) return null
+    
+    const result = await dialog.showOpenDialog(mainWindow, {
+      properties: ['openFile', 'multiSelections'],
+      title: '选择图片',
+      filters: [
+        { name: '图片文件', extensions: ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'svg'] },
+        { name: '所有文件', extensions: ['*'] },
+      ],
+    })
+    
+    if (result.canceled || result.filePaths.length === 0) {
+      return null
+    }
+
+    // 读取图片文件并转换为 Base64
+    const attachments: Array<{ type: string; name: string; content: string }> = []
+    
+    for (const filePath of result.filePaths) {
+      try {
+        const fs = await import('fs')
+        const path = await import('path')
+        
+        const fileName = path.default.basename(filePath)
+        const fileExt = path.default.extname(filePath).toLowerCase()
+        
+        // 读取文件内容
+        const fileBuffer = fs.default.readFileSync(filePath)
+        const base64Content = `data:image/${fileExt.replace('.', '')};base64,${fileBuffer.toString('base64')}`
+        
+        // 确定 MIME 类型
+        const mimeTypes: Record<string, string> = {
+          '.jpg': 'image/jpeg',
+          '.jpeg': 'image/jpeg',
+          '.png': 'image/png',
+          '.gif': 'image/gif',
+          '.bmp': 'image/bmp',
+          '.webp': 'image/webp',
+          '.svg': 'image/svg+xml',
+        }
+        
+        attachments.push({
+          type: mimeTypes[fileExt] || 'image/png',
+          name: fileName,
+          content: base64Content,
+        })
+      } catch (error) {
+        console.error(`[Main] Failed to read image file: ${filePath}`, error)
+      }
+    }
+    
+    return attachments.length > 0 ? attachments : null
+  })
+
   // 获取应用版本
   ipcMain.handle('get-version', () => {
     return app.getVersion()
@@ -86,9 +144,13 @@ app.whenReady().then(() => {
     return process.platform
   })
 
+  // Initialize Provider Manager
+  const providerManager = getProviderManager()
+  console.log('[Main] ProviderManager initialized:', providerManager.getActiveProvider()?.name || 'none')
+
   createWindow()
   
-  // 注册 ACP IPC handlers
+  // 注册 ACP IPC handlers (Provider Manager will be used internally)
   if (mainWindow) {
     registerIpcHandlers(mainWindow)
   }
@@ -112,6 +174,8 @@ app.on('before-quit', async () => {
   try {
     // 清理 IPC handlers 和 ACP 连接
     unregisterIpcHandlers()
+    // 清理 Provider Manager
+    resetProviderManager()
     console.log('[Main] Resources cleaned up successfully')
   } catch (error) {
     console.error('[Main] Error during cleanup:', error)

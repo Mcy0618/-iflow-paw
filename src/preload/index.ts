@@ -1,10 +1,13 @@
 import { contextBridge, ipcRenderer, IpcRendererEvent } from 'electron'
 
+// 连接模式类型
+export type ConnectionModeType = 'sdk' | 'acp' | 'provider'
+
 // ACP API 定义
 const acpAPI = {
   // 连接管理
-  connect: async (): Promise<{ success: boolean; error?: string }> => {
-    return ipcRenderer.invoke('acp:connect')
+  connect: async (mode?: ConnectionModeType): Promise<{ success: boolean; error?: string; connectionType?: string }> => {
+    return ipcRenderer.invoke('acp:connect', { mode })
   },
   
   disconnect: async (): Promise<void> => {
@@ -12,8 +15,9 @@ const acpAPI = {
   },
   
   // 发送消息
-  sendPrompt: async (prompt: string): Promise<{ success: boolean; error?: string }> => {
-        return ipcRenderer.invoke('acp:sendPrompt', { prompt, attachments: [] })  },
+  sendPrompt: async (prompt: string, aiMessageId?: string, attachments?: Array<{ type: string; name: string; content?: string; path?: string }>): Promise<{ success: boolean; error?: string; aiMessageId?: string }> => {
+    return ipcRenderer.invoke('acp:sendPrompt', { prompt, attachments: attachments || [], aiMessageId })
+  },
   
   // 设置选项
   setMode: async (mode: string): Promise<{ success: boolean; error?: string }> => {
@@ -26,6 +30,24 @@ const acpAPI = {
   
   setDeepThinking: async (enabled: boolean, level?: number): Promise<{ success: boolean; error?: string }> => {
     return ipcRenderer.invoke('acp:setDeepThinking', { enabled, level })
+  },
+  
+  setWorkspace: async (path: string): Promise<{ success: boolean; error?: string }> => {
+    return ipcRenderer.invoke('acp:setWorkspace', { path })
+  },
+  
+  // 获取当前设置
+  getSettings: async (): Promise<{ 
+    success: boolean; 
+    data?: {
+      mode: string;
+      model: string;
+      deepThinking: boolean;
+      deepThinkingLevel?: number;
+    };
+    error?: string 
+  }> => {
+    return ipcRenderer.invoke('acp:getSettings')
   },
   
   // 事件监听
@@ -85,6 +107,11 @@ const sessionAPI = {
   selectFolder: async (): Promise<string | null> => {
     return ipcRenderer.invoke('select-folder')
   },
+  
+  // 选择图片文件
+  selectImage: async (): Promise<Array<{ type: string; name: string; content: string }> | null> => {
+    return ipcRenderer.invoke('select-image')
+  },
 }
 
 // 应用 API 定义
@@ -98,11 +125,35 @@ const appAPI = {
   },
 }
 
+// Provider API 定义
+const providerAPI = {
+  list: async (): Promise<Array<{ name: string; baseUrl: string; model: string; isEnabled: boolean }>> => {
+    return ipcRenderer.invoke('provider:list')
+  },
+  
+  getActive: async (): Promise<{ name: string; baseUrl: string; model: string } | null> => {
+    return ipcRenderer.invoke('provider:getActive')
+  },
+  
+  setActive: async (name: string): Promise<{ success: boolean; error?: string }> => {
+    return ipcRenderer.invoke('provider:setActive', { name })
+  },
+  
+  sync: async (providers: Array<{ name: string; apiKey: string; baseUrl: string; model: string; isEnabled: boolean }>, activeProvider: string | null): Promise<{ success: boolean; error?: string }> => {
+    return ipcRenderer.invoke('provider:sync', { providers, activeProvider })
+  },
+  
+  sendPrompt: async (messages: Array<{ role: string; content: string }>, options: { model?: string; mode?: string; deepThinking?: boolean }): Promise<{ success: boolean; error?: string }> => {
+    return ipcRenderer.invoke('provider:sendPrompt', { messages, options })
+  },
+}
+
 // 暴露 API 到渲染进程
 contextBridge.exposeInMainWorld('electronAPI', {
   acp: acpAPI,
   session: sessionAPI,
   app: appAPI,
+  provider: providerAPI,
 })
 
 // 类型导出
@@ -110,4 +161,5 @@ export type ElectronAPI = {
   acp: typeof acpAPI
   session: typeof sessionAPI
   app: typeof appAPI
+  provider: typeof providerAPI
 }

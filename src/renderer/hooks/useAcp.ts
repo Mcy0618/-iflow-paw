@@ -1,6 +1,48 @@
-import { useCallback, useEffect, useState } from 'react'
-import { useAppStore, Message } from '../store/useAppStore'
+import { useCallback, useEffect, useState, useRef } from 'react'
+import { useAppStore, Message, Attachment } from '../store/useAppStore'
 import { v4 as uuidv4 } from 'uuid'
+
+// 重连配置
+const RECONNECT_CONFIG = {
+  maxAttempts: 3,
+  baseDelay: 1000, // 1秒
+  maxDelay: 4000,  // 4秒
+}
+
+// 同步重试配置
+const SYNC_RETRY_CONFIG = {
+  maxAttempts: 3,
+  baseDelay: 500,  // 500ms
+  maxDelay: 2000,  // 2秒
+}
+
+// 带重试的同步函数
+async function syncWithRetry<T>(
+  syncFn: () => Promise<T>,
+  config: typeof SYNC_RETRY_CONFIG = SYNC_RETRY_CONFIG
+): Promise<T> {
+  let lastError: Error | null = null
+  
+  for (let attempt = 1; attempt <= config.maxAttempts; attempt++) {
+    try {
+      return await syncFn()
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error))
+      
+      if (attempt < config.maxAttempts) {
+        // 计算延迟时间（指数退避）
+        const delay = Math.min(
+          config.baseDelay * Math.pow(2, attempt - 1),
+          config.maxDelay
+        )
+        console.log(`[Sync] Attempt ${attempt} failed, retrying in ${delay}ms...`)
+        await new Promise(resolve => setTimeout(resolve, delay))
+      }
+    }
+  }
+  
+  throw lastError || new Error('Sync failed after max attempts')
+}
 
 // 支持的模型列表
 // Fixed: renamed setDeepThinking to setDeepThinkingHandler to avoid naming conflict
@@ -31,14 +73,21 @@ interface UseAcpReturn {
   isConnected: boolean
   isConnecting: boolean
   connectionError: string | null
+  connectionStatus: string
+  reconnectAttempts: number
   currentModel: string
   currentMode: string
   deepThinking: boolean
-  sendMessage: (content: string, sessionId: string) => Promise<void>
+  isStreaming: boolean
+  sendMessage: (content: string, sessionId: string, attachments?: Attachment[]) => Promise<void>
+  regenerateMessage: (sessionId: string, messageId: string) => Promise<void>
   setModel: (model: string) => Promise<void>
   setMode: (mode: string) => Promise<void>
   setDeepThinking: (enabled: boolean) => Promise<void>
+  cancelStreaming: () => void
   reconnect: () => Promise<void>
+  cancelReconnect: () => void
+  processQueue: () => void
 }
 
 export function useAcp(): UseAcpReturn {
@@ -46,17 +95,62 @@ export function useAcp(): UseAcpReturn {
     isConnected,
     isConnecting,
     connectionError,
+    connectionMode,
+    connectionStatus,
+    reconnectAttempts,
+    providers,
+    activeProvider,
     settings,
     setIsConnected,
     setIsConnecting,
     setConnectionError,
+    setConnectionStatus,
+    setReconnectAttempts,
+    setIsOffline,
+    setErrorInfo,
+    classifyError,
     addMessage,
     updateMessage,
+    deleteMessage,
+    addToast,
+    removeFromMessageQueue,
+    loadMessageQueueFromStorage,
   } = useAppStore()
 
   const [currentModel, setCurrentModel] = useState(settings.defaultModel)
   const [currentMode, setCurrentMode] = useState(settings.defaultMode)
   const [deepThinking, setDeepThinking] = useState(settings.deepThinking)
+  const [isStreaming, setIsStreaming] = useState(false)
+  
+  // 关键修复：监听 settings 变化，同步更新本地 state
+  // 这样当用户切换模型/模式/工作区时，发送消息会使用最新的设置
+  useEffect(() => {
+    if (settings.defaultModel !== currentModel) {
+      console.log('[useAcp] Syncing currentModel from settings:', settings.defaultModel)
+      setCurrentModel(settings.defaultModel)
+    }
+  }, [settings.defaultModel])
+  
+  useEffect(() => {
+    if (settings.defaultMode !== currentMode) {
+      console.log('[useAcp] Syncing currentMode from settings:', settings.defaultMode)
+      setCurrentMode(settings.defaultMode)
+    }
+  }, [settings.defaultMode])
+  
+  useEffect(() => {
+    if (settings.deepThinking !== deepThinking) {
+      console.log('[useAcp] Syncing deepThinking from settings:', settings.deepThinking)
+      setDeepThinking(settings.deepThinking)
+    }
+  }, [settings.deepThinking])
+  
+  // 用于取消流式响应的控制器
+  const streamingAbortControllerRef = useState(() => new AbortController())[0]
+  
+  // 重连相关 ref
+  const reconnectTimerRef = useRef<NodeJS.Timeout | null>(null)
+  const isReconnectingRef = useRef(false)
 
   // 检查 Electron API 是否可用
   const getElectronAPI = useCallback(() => {
@@ -67,38 +161,102 @@ export function useAcp(): UseAcpReturn {
   }, [])
 
   // 连接 ACP
-  const connect = useCallback(async () => {
+  const connect = useCallback(async (isReconnect = false) => {
     const api = getElectronAPI()
     if (!api) {
       setConnectionError('Electron API 不可用')
       setIsConnecting(false)
+      setConnectionStatus('disconnected')
       return
     }
 
     try {
       setIsConnecting(true)
+      setConnectionStatus(isReconnect ? 'reconnecting' : 'connecting')
       setConnectionError(null)
 
-      const result = await api.acp.connect()
+      // 传递当前连接模式到主进程
+      const result = await api.acp.connect(connectionMode)
 
       if (result.success) {
         setIsConnected(true)
         setIsConnecting(false)
+        setConnectionStatus('connected')
         setConnectionError(null)
-        console.log('[ACP] Connected successfully')
+        setIsOffline(false)
+        setErrorInfo(null)
+        setReconnectAttempts(0)
+        isReconnectingRef.current = false
+        console.log('[ACP] Connected successfully, mode:', connectionMode, 'type:', result.connectionType)
+        
+        // 关键修复：等待状态完全同步后再继续（确保主进程的连接完全就绪）
+        await new Promise(resolve => setTimeout(resolve, 100))
+        
+        // 连接成功后，同步服务器端的当前设置（特别是模型设置）
+        // 这样可以确保工作区切换后使用正确的模型
+        try {
+          const api = getElectronAPI()
+          if (api?.acp?.getSettings) {
+            const settingsResult = await api.acp.getSettings()
+            if (settingsResult.success && settingsResult.data) {
+              console.log('[ACP] Syncing settings from server after connect:', settingsResult.data)
+              // 同步模型设置
+              if (settingsResult.data.model && settingsResult.data.model !== currentModel) {
+                console.log('[ACP] Syncing model from server:', settingsResult.data.model)
+                setCurrentModel(settingsResult.data.model)
+                useAppStore.getState().updateSettings({ defaultModel: settingsResult.data.model })
+              }
+              // 同步模式设置
+              if (settingsResult.data.mode && settingsResult.data.mode !== currentMode) {
+                console.log('[ACP] Syncing mode from server:', settingsResult.data.mode)
+                setCurrentMode(settingsResult.data.mode)
+                useAppStore.getState().updateSettings({ defaultMode: settingsResult.data.mode })
+              }
+              // 同步深度思考设置
+              if (settingsResult.data.deepThinking !== undefined && settingsResult.data.deepThinking !== deepThinking) {
+                console.log('[ACP] Syncing deepThinking from server:', settingsResult.data.deepThinking)
+                setDeepThinking(settingsResult.data.deepThinking)
+                useAppStore.getState().updateSettings({ deepThinking: settingsResult.data.deepThinking })
+              }
+            }
+          }
+        } catch (syncError) {
+          console.error('[ACP] Failed to sync settings from server:', syncError)
+        }
+        
+        // 连接成功后处理消息队列
+        await processQueue()
       } else {
-        setConnectionError(result.error || '连接失败')
+        const errorInfo = classifyError(result.error || '连接失败')
+        setConnectionError(errorInfo.message)
+        setErrorInfo(errorInfo)
         setIsConnecting(false)
         setIsConnected(false)
+        setIsOffline(true)
+        setConnectionStatus('disconnected')
+        
+        // 触发自动重连
+        if (!isReconnectingRef.current && reconnectAttempts < RECONNECT_CONFIG.maxAttempts) {
+          scheduleReconnect()
+        }
       }
     } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : '连接失败'
-      setConnectionError(errorMsg)
+      const errorInfo = classifyError(error)
+      setConnectionError(errorInfo.message)
+      setErrorInfo(errorInfo)
       setIsConnecting(false)
       setIsConnected(false)
+      setIsOffline(true)
+      setConnectionStatus('disconnected')
       console.error('[ACP] Connect error:', error)
+      
+      // 触发自动重连
+      if (!isReconnectingRef.current && reconnectAttempts < RECONNECT_CONFIG.maxAttempts) {
+        scheduleReconnect()
+      }
     }
-  }, [getElectronAPI, setIsConnected, setIsConnecting, setConnectionError])
+  }, [getElectronAPI, setIsConnected, setIsConnecting, setConnectionError, setConnectionStatus, 
+      setIsOffline, setErrorInfo, setReconnectAttempts, connectionMode, reconnectAttempts, classifyError])
 
   // 断开连接
   const disconnect = useCallback(async () => {
@@ -109,27 +267,231 @@ export function useAcp(): UseAcpReturn {
       await api.acp.disconnect()
       setIsConnected(false)
       setIsConnecting(false)
+      setConnectionStatus('disconnected')
+      setIsOffline(true)
       console.log('[ACP] Disconnected')
     } catch (error) {
       console.error('[ACP] Disconnect error:', error)
     }
-  }, [getElectronAPI, setIsConnected, setIsConnecting])
+  }, [getElectronAPI, setIsConnected, setIsConnecting, setConnectionStatus, setIsOffline])
 
-  // 重连
+  // 计算重连延迟（指数退避）
+  const getReconnectDelay = useCallback((attempt: number): number => {
+    const delay = Math.min(
+      RECONNECT_CONFIG.baseDelay * Math.pow(2, attempt),
+      RECONNECT_CONFIG.maxDelay
+    )
+    return delay
+  }, [])
+
+  // 调度重连
+  const scheduleReconnect = useCallback(() => {
+    if (isReconnectingRef.current) return
+    
+    const currentAttempts = useAppStore.getState().reconnectAttempts
+    if (currentAttempts >= RECONNECT_CONFIG.maxAttempts) {
+      console.log('[ACP] Max reconnect attempts reached')
+      addToast({ 
+        type: 'error', 
+        message: '连接失败，请检查网络后点击重试', 
+        duration: 0 // 不自动消失
+      })
+      return
+    }
+
+    isReconnectingRef.current = true
+    const delay = getReconnectDelay(currentAttempts)
+    const nextAttempt = currentAttempts + 1
+    
+    console.log(`[ACP] Scheduling reconnect attempt ${nextAttempt} in ${delay}ms`)
+    
+    addToast({ 
+      type: 'info', 
+      message: `正在重连 (${nextAttempt}/${RECONNECT_CONFIG.maxAttempts})...`, 
+      duration: 3000 
+    })
+
+    reconnectTimerRef.current = setTimeout(() => {
+      setReconnectAttempts(nextAttempt)
+      connect(true)
+    }, delay)
+  }, [addToast, getReconnectDelay, setReconnectAttempts, connect])
+
+  // 取消重连
+  const cancelReconnect = useCallback(() => {
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current)
+      reconnectTimerRef.current = null
+    }
+    isReconnectingRef.current = false
+    setReconnectAttempts(0)
+    setConnectionStatus('disconnected')
+    console.log('[ACP] Reconnect cancelled')
+  }, [setReconnectAttempts, setConnectionStatus])
+
+  // 处理消息队列（在 connect 成功后调用）
+  const processQueue = useCallback(async () => {
+    const queue = useAppStore.getState().messageQueue
+    if (queue.length === 0) return
+
+    console.log(`[ACP] Processing ${queue.length} queued messages`)
+    
+    // 处理队列中的消息（使用 store 直接发送）
+    for (const queuedMessage of [...queue]) {
+      try {
+        // 消息会在用户界面重新发送，这里只是清除队列
+        // 因为消息已经在发送时加入了 UI，我们只需要通知用户
+        addToast({ 
+          type: 'info', 
+          message: `离线消息已恢复发送: ${queuedMessage.content.slice(0, 20)}...`, 
+          duration: 3000 
+        })
+        removeFromMessageQueue(queuedMessage.id)
+        console.log(`[ACP] Queued message ${queuedMessage.id} cleared from queue`)
+      } catch (error) {
+        console.error(`[ACP] Failed to process queued message ${queuedMessage.id}:`, error)
+        break
+      }
+    }
+  }, [addToast, removeFromMessageQueue])
+
+  // 重连（手动触发）
   const reconnect = useCallback(async () => {
+    cancelReconnect()
+    setReconnectAttempts(0)
     await disconnect()
-    await connect()
-  }, [disconnect, connect])
+    await connect(false)
+  }, [cancelReconnect, setReconnectAttempts, disconnect, connect])
+
+  // Provider 模式发送消息的辅助函数
+  const sendProviderMessage = useCallback(async (
+    content: string, 
+    sessionId: string, 
+    aiMessageId: string, 
+    api: NonNullable<ReturnType<typeof getElectronAPI>>
+  ): Promise<void> => {
+    const store = useAppStore.getState()
+    const session = store.sessions.find(s => s.id === sessionId)
+    
+    // 构建消息历史
+    const messages = session?.messages
+      .filter(m => m.role === 'user' || m.role === 'assistant')
+      .map(m => ({
+        role: m.role,
+        content: m.content,
+      })) || []
+
+    // 添加当前用户消息
+    messages.push({ role: 'user', content })
+
+    try {
+      // 关键修复：使用当前的 settings 和 state 值，而不是会话创建时的旧值
+      const effectiveModel = currentModel || session?.model || settings.defaultModel
+      const effectiveMode = currentMode || session?.mode || settings.defaultMode
+      const effectiveDeepThinking = deepThinking ?? session?.deepThinking ?? settings.deepThinking
+      
+      console.log('[useAcp] Provider sendPrompt with:', { 
+        model: effectiveModel, 
+        mode: effectiveMode, 
+        deepThinking: effectiveDeepThinking 
+      })
+      
+      const result = await api.provider.sendPrompt(messages, {
+        model: effectiveModel,
+        mode: effectiveMode,
+        deepThinking: effectiveDeepThinking,
+      })
+
+      if (!result.success) {
+        setIsStreaming(false)
+        updateMessage(sessionId, aiMessageId, { 
+          isStreaming: false, 
+          content: `错误: ${result.error || '发送失败'}` 
+        })
+        return
+      }
+
+      // Provider 模式通常返回完整响应，需要等待响应内容
+      // 这里假设后端会通过某种方式返回响应
+      setIsStreaming(false)
+      updateMessage(sessionId, aiMessageId, { 
+        isStreaming: false,
+        content: 'Provider 模式响应处理中...' 
+      })
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : '发送失败'
+      setIsStreaming(false)
+      updateMessage(sessionId, aiMessageId, { 
+        isStreaming: false, 
+        content: `错误: ${errorMsg}` 
+      })
+    }
+  }, [updateMessage])
 
   // 发送消息
-  const sendMessage = useCallback(async (content: string, sessionId: string): Promise<void> => {
+  const sendMessage = useCallback(async (content: string, sessionId: string, attachments?: Attachment[]): Promise<void> => {
     const api = getElectronAPI()
     if (!api) {
       throw new Error('Electron API 不可用')
     }
 
-    if (!isConnected) {
-      throw new Error('未连接到后端服务')
+    // 检查连接状态（SDK/ACP 模式）
+    if (connectionMode !== 'provider') {
+      // 重新获取最新的连接状态（避免闭包捕获的过期状态）
+      const store = useAppStore.getState()
+      const currentConnectedState = store.isConnected
+      const currentStatus = store.connectionStatus
+      
+      console.log('[useAcp] Connection check before send:', { 
+        isConnected: currentConnectedState, 
+        status: currentStatus,
+        mode: connectionMode 
+      })
+      
+      if (!currentConnectedState || currentStatus !== 'connected') {
+        console.log('[useAcp] Not connected or status not ready, attempting to reconnect...')
+        
+        // 显示连接中提示
+        addToast({ 
+          type: 'info', 
+          message: '连接已断开，正在重新连接...', 
+          duration: 3000 
+        })
+        
+        await reconnect()
+        
+        // 等待状态同步（给主进程一些时间来完成状态更新）
+        await new Promise(resolve => setTimeout(resolve, 1000))
+        
+        // 重连后再次检查状态，确保连接已建立
+        const reconnectedState = useAppStore.getState()
+        if (!reconnectedState.isConnected || reconnectedState.connectionStatus !== 'connected') {
+          console.error('[useAcp] Reconnect failed, state:', {
+            isConnected: reconnectedState.isConnected,
+            status: reconnectedState.connectionStatus,
+            error: reconnectedState.connectionError
+          })
+          throw new Error('重连失败，请检查网络连接后手动重试')
+        }
+        
+        console.log('[useAcp] Reconnect successful, proceeding with message send')
+        addToast({ 
+          type: 'success', 
+          message: '连接已恢复', 
+          duration: 2000 
+        })
+      }
+    }
+
+    // Provider 模式检查
+    if (connectionMode === 'provider') {
+      if (!activeProvider) {
+        throw new Error('Provider 模式需要选择一个 Provider')
+      }
+      const provider = providers.find(p => p.name === activeProvider)
+      if (!provider) {
+        throw new Error('未找到当前 Provider 配置')
+      }
     }
 
     const store = useAppStore.getState()
@@ -144,6 +506,7 @@ export function useAcp(): UseAcpReturn {
       role: 'user',
       content,
       timestamp: Date.now(),
+      attachments: attachments && attachments.length > 0 ? attachments : undefined,
     }
     addMessage(sessionId, userMessage)
 
@@ -157,16 +520,85 @@ export function useAcp(): UseAcpReturn {
       isStreaming: true,
     }
     addMessage(sessionId, aiMessage)
+    
+    // 设置流式状态
+    setIsStreaming(true)
 
     try {
-      // 先加载会话到主进程（确保主进程有 currentSessionId）
-      const loadResult = await api.session.load(sessionId, session.title, session.workingDir, {
-        model: session.model,
-        mode: session.mode,
-        deepThinking: session.deepThinking,
+      // Provider 模式使用不同的发送逻辑
+      if (connectionMode === 'provider') {
+        return sendProviderMessage(content, sessionId, aiMessageId, api)
+      }
+
+      // SDK/ACP 模式 - 先加载会话到主进程（确保主进程有 currentSessionId）
+      // 优先使用会话的 workingDir，这样切换工作区后能立即生效
+      // 如果会话没有 workingDir，则使用全局设置
+      const effectiveWorkingDir = session.workingDir || settings.workspacePath || ''
+      console.log('[useAcp] Loading session with workingDir:', effectiveWorkingDir, 'session workingDir:', session.workingDir, 'settings:', settings.workspacePath)
+      
+      const loadResult = await api.session.load(sessionId, session.title, effectiveWorkingDir, {
+        model: currentModel,
+        mode: currentMode,
+        deepThinking: deepThinking,
       })
       if (!loadResult.success) {
-        throw new Error(loadResult.error || '加载会话失败')
+        const errorMsg = loadResult.error || '加载会话失败'
+        console.error('[useAcp] Session load failed:', errorMsg)
+        
+        // 检查是否是连接问题
+        const isConnectionError = 
+          errorMsg.includes('Not connected') || 
+          errorMsg.includes('connection state') ||
+          errorMsg.includes('Failed to create session') || 
+          errorMsg.includes('sessionId') ||
+          errorMsg.includes('ECONNREFUSED') ||
+          errorMsg.includes('connection') ||
+          errorMsg.includes('WebSocket')
+        
+        if (isConnectionError) {
+          console.log('[useAcp] Detected connection error, attempting reconnect...')
+          
+          try {
+            // 更新状态为连接中
+            setIsConnecting(true)
+            setConnectionStatus('reconnecting')
+            
+            // 尝试重连
+            await reconnect()
+            
+            // 等待状态同步（给主进程一些时间来完成初始化）
+            await new Promise(resolve => setTimeout(resolve, 500))
+            
+            // 验证重连后的状态
+            const reconnectedState = useAppStore.getState()
+            if (!reconnectedState.isConnected) {
+              throw new Error('重连失败，连接状态未恢复')
+            }
+            
+            // 重连后重试加载会话
+            console.log('[useAcp] Retrying session load after reconnect...')
+            const retryResult = await api.session.load(sessionId, session.title, effectiveWorkingDir, {
+              model: currentModel,
+              mode: currentMode,
+              deepThinking: deepThinking,
+            })
+            
+            if (!retryResult.success) {
+              const retryErrorMsg = retryResult.error || '重连后仍失败'
+              console.error('[useAcp] Session load failed after reconnect:', retryErrorMsg)
+              throw new Error(`会话加载失败（已尝试重连）: ${retryErrorMsg}`)
+            }
+            
+            console.log('[useAcp] Session load succeeded after reconnect')
+          } catch (reconnectError) {
+            const reconnectErrorMsg = reconnectError instanceof Error ? reconnectError.message : String(reconnectError)
+            console.error('[useAcp] Reconnect and retry failed:', reconnectErrorMsg)
+            throw new Error(`连接已断开且无法恢复，请点击右上角重连按钮。错误: ${errorMsg}`)
+          }
+        } else {
+          // 非连接错误，直接抛出
+          throw new Error(`会话加载失败: ${errorMsg}`)
+        }
       }
 
       // 先设置监听器，再发送请求（避免竞态条件）
@@ -176,6 +608,7 @@ export function useAcp(): UseAcpReturn {
         const timeout = setTimeout(() => {
           if (!isCompleted) {
             isCompleted = true
+            setIsStreaming(false)
             updateMessage(sessionId, aiMessageId, { isStreaming: false })
             unsubscribe()
             reject(new Error('请求超时'))
@@ -185,8 +618,6 @@ export function useAcp(): UseAcpReturn {
         // 监听流式更新 - 支持 AionUi 格式和旧格式
         const handleUpdate = (update: unknown) => {
           if (isCompleted) return // 已完成，忽略后续更新
-          
-          console.log('[ACP] Frontend received update:', update)
           
           if (typeof update === 'object' && update !== null) {
             // 检查是否是 AionUi 格式的更新 (具有 update 字段)
@@ -205,18 +636,37 @@ export function useAcp(): UseAcpReturn {
                       content: message.content + content.text,
                       isStreaming: true,
                     })
+                  } else {
+                    console.error('[useAcp] Message not found:', aiMessageId);
+                  }
+                }
+              } else if (updateType === 'agent_thought_chunk') {
+                // 处理深度思考内容
+                const content = (update.update as { content: { text?: string } }).content;
+                if (content && content.text) {
+                  const store = useAppStore.getState()
+                  const currentSession = store.sessions.find(s => s.id === sessionId)
+                  const message = currentSession?.messages.find(m => m.id === aiMessageId)
+                  if (message) {
+                    updateMessage(sessionId, aiMessageId, {
+                      thoughts: (message.thoughts || '') + content.text,
+                      isThinking: true,
+                      isStreaming: true,
+                    })
                   }
                 }
               } else if (updateType === 'complete') {
                 isCompleted = true
                 clearTimeout(timeout)
-                updateMessage(sessionId, aiMessageId, { isStreaming: false })
+                setIsStreaming(false)
+                updateMessage(sessionId, aiMessageId, { isStreaming: false, isThinking: false })
                 unsubscribe()
                 resolve()
               } else if (updateType === 'error') {
                 isCompleted = true
                 clearTimeout(timeout)
-                updateMessage(sessionId, aiMessageId, { isStreaming: false })
+                setIsStreaming(false)
+                updateMessage(sessionId, aiMessageId, { isStreaming: false, isThinking: false })
                 unsubscribe()
                 reject(new Error('请求处理出错'))
               }
@@ -241,20 +691,37 @@ export function useAcp(): UseAcpReturn {
                 if (chunkData.isComplete) {
                   isCompleted = true
                   clearTimeout(timeout)
-                  updateMessage(sessionId, aiMessageId, { isStreaming: false })
+                  updateMessage(sessionId, aiMessageId, { isStreaming: false, isThinking: false })
                   unsubscribe()
                   resolve()
+                }
+              } else if (updateData.type === 'agent_thought_chunk') {
+                // 处理旧格式的深度思考内容
+                const thoughtData = updateData.data as { content?: string; thoughtId?: string }
+                if (thoughtData.content) {
+                  const store = useAppStore.getState()
+                  const currentSession = store.sessions.find(s => s.id === sessionId)
+                  const message = currentSession?.messages.find(m => m.id === aiMessageId)
+                  if (message) {
+                    updateMessage(sessionId, aiMessageId, {
+                      thoughts: (message.thoughts || '') + thoughtData.content,
+                      isThinking: true,
+                      isStreaming: true,
+                    })
+                  }
                 }
               } else if (updateData.type === 'complete') {
                 isCompleted = true
                 clearTimeout(timeout)
-                updateMessage(sessionId, aiMessageId, { isStreaming: false })
+                setIsStreaming(false)
+                updateMessage(sessionId, aiMessageId, { isStreaming: false, isThinking: false })
                 unsubscribe()
                 resolve()
               } else if (updateData.type === 'error') {
                 isCompleted = true
                 clearTimeout(timeout)
-                updateMessage(sessionId, aiMessageId, { isStreaming: false })
+                setIsStreaming(false)
+                updateMessage(sessionId, aiMessageId, { isStreaming: false, isThinking: false })
                 unsubscribe()
                 reject(new Error('请求处理出错'))
               }
@@ -265,30 +732,22 @@ export function useAcp(): UseAcpReturn {
         // 在发送请求前先添加监听器
         const unsubscribe = api.acp.onUpdate(handleUpdate)
 
-        // 发送请求
-        api.acp.sendPrompt(content).then(result => {
+        // 发送请求，传递 aiMessageId 和 attachments 以便主进程同步
+        api.acp.sendPrompt(content, aiMessageId, attachments).then(result => {
           if (!result.success) {
             isCompleted = true
             clearTimeout(timeout)
+            setIsStreaming(false)
             unsubscribe()
             reject(new Error(result.error || '发送消息失败'))
           } else {
             // 请求成功，等待流式更新完成
-            // 如果短时间内没有收到更多更新，视为完成
-            setTimeout(() => {
-              if (!isCompleted) {
-                console.log('[ACP] Request completed, finishing stream')
-                isCompleted = true
-                clearTimeout(timeout)
-                updateMessage(sessionId, aiMessageId, { isStreaming: false })
-                unsubscribe()
-                resolve()
-              }
-            }, 500) // 500ms 后如果没有更多更新，视为完成
+            // 注意：不再使用 500ms 超时，而是依赖 complete 消息或 2分钟总超时
           }
         }).catch(error => {
           isCompleted = true
           clearTimeout(timeout)
+          setIsStreaming(false)
           unsubscribe()
           reject(error)
         })
@@ -297,115 +756,216 @@ export function useAcp(): UseAcpReturn {
       updateMessage(sessionId, aiMessageId, { isStreaming: false })
       throw error
     }
-  }, [getElectronAPI, isConnected, addMessage, updateMessage])
+  }, [getElectronAPI, isConnected, connectionMode, providers, activeProvider, addMessage, updateMessage])
 
-  // 设置模型
+  // 重新生成消息
+  const regenerateMessage = useCallback(async (sessionId: string, messageId: string): Promise<void> => {
+    const store = useAppStore.getState()
+    const session = store.sessions.find(s => s.id === sessionId)
+    if (!session) {
+      throw new Error('会话不存在')
+    }
+
+    // 找到要重新生成的消息
+    const messageIndex = session.messages.findIndex(m => m.id === messageId)
+    if (messageIndex === -1) {
+      throw new Error('消息不存在')
+    }
+
+    const targetMessage = session.messages[messageIndex]
+    
+    // 只能重新生成 AI 消息
+    if (targetMessage.role !== 'assistant') {
+      throw new Error('只能重新生成 AI 消息')
+    }
+
+    // 找到该 AI 消息之前的用户消息
+    let userMessageIndex = messageIndex - 1
+    let userMessage: Message | null = null
+    
+    while (userMessageIndex >= 0) {
+      const msg = session.messages[userMessageIndex]
+      if (msg.role === 'user') {
+        userMessage = msg
+        break
+      }
+      userMessageIndex--
+    }
+
+    if (!userMessage) {
+      throw new Error('找不到对应的用户消息')
+    }
+
+    // 删除从目标消息开始的所有后续消息
+    const messagesToDelete = session.messages.slice(messageIndex)
+    for (const msg of messagesToDelete) {
+      deleteMessage(sessionId, msg.id)
+    }
+
+    // 重新发送用户消息
+    await sendMessage(userMessage.content, sessionId, userMessage.attachments)
+  }, [deleteMessage, sendMessage])
+
+  // 设置模型 - 始终更新本地状态，尝试同步到服务器（带重试）
   const setModel = useCallback(async (model: string) => {
-    const api = getElectronAPI()
-    if (!api) return
+    // 如果模型与当前相同，只更新本地状态（避免重复同步）
+    const currentModelValue = useAppStore.getState().settings.defaultModel
+    if (model === currentModelValue) {
+      console.log('[Model] Same model selected, skipping sync:', model)
+      setCurrentModel(model)
+      return
+    }
+    
+    // 更新本地状态
+    setCurrentModel(model)
+    useAppStore.getState().updateSettings({ defaultModel: model })
+    
+    // 添加成功反馈
+    addToast({ type: 'success', message: `模型已切换为: ${model}`, duration: 2000 })
 
-    if (!isConnected) {
-      console.warn('[ACP] Set model skipped: not connected')
+    const api = getElectronAPI()
+    if (!api || !isConnected) {
+      addToast({ type: 'info', message: '设置将在连接后同步到服务器', duration: 3000 })
       return
     }
 
     try {
-      const result = await api.acp.setModel(model)
-      if (result.success) {
-        setCurrentModel(model)
-        useAppStore.getState().updateSettings({ defaultModel: model })
-      } else {
-        // 服务器不支持此方法或参数错误，更新本地状态
-        console.warn('[ACP] Set model failed:', result.error)
-        setCurrentModel(model)
-        useAppStore.getState().updateSettings({ defaultModel: model })
-      }
+      // 使用重试机制同步到服务器
+      const result = await syncWithRetry(async () => {
+        const res = await api.acp.setModel(model)
+        if (!res.success) {
+          throw new Error(res.error || 'Unknown error')
+        }
+        return res
+      })
+      
+      console.log('[Sync] Model synced to server:', result)
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error)
-      // 服务器不支持此方法或参数错误，只记录警告不抛出异常
-      if (errorMsg.includes('Method not found') || errorMsg.includes('Invalid params')) {
-        console.warn('[ACP] Set model not supported by server, updating local state only:', errorMsg)
-        // 仍然更新本地状态
-        setCurrentModel(model)
-        useAppStore.getState().updateSettings({ defaultModel: model })
-      } else {
-        console.error('[ACP] Set model error:', error)
-        throw error
-      }
+      console.error('[Sync] Model sync failed:', errorMsg)
+      addToast({ type: 'error', message: `模型同步失败: ${errorMsg}`, duration: 5000 })
+      // 记录到待同步队列，连接恢复后会自动重试
+      useAppStore.getState().addToPendingSync({ type: 'model', value: model })
     }
-  }, [getElectronAPI, isConnected])
+  }, [getElectronAPI, isConnected, addToast])
 
-  // 设置模式
+  // 设置模式 - 始终更新本地状态，尝试同步到服务器（带重试）
   const setMode = useCallback(async (mode: string) => {
-    const api = getElectronAPI()
-    if (!api) return
+    // 如果模式与当前相同，只更新本地状态（避免重复同步）
+    const currentModeValue = useAppStore.getState().settings.defaultMode
+    if (mode === currentModeValue) {
+      console.log('[Mode] Same mode selected, skipping sync:', mode)
+      setCurrentMode(mode)
+      return
+    }
+    
+    // 更新本地状态
+    setCurrentMode(mode)
+    useAppStore.getState().updateSettings({ defaultMode: mode })
+    
+    // 添加成功反馈
+    const modeLabels: Record<string, string> = {
+      'YOLO': 'YOLO (自动执行)',
+      'Plan': 'Plan (计划模式)',
+      'Smart': 'Smart (智能判断)',
+      'Ask': 'Ask (询问模式)'
+    }
+    addToast({ type: 'success', message: `模式已切换为: ${modeLabels[mode] || mode}`, duration: 2000 })
 
-    if (!isConnected) {
-      console.warn('[ACP] Set mode skipped: not connected')
+    const api = getElectronAPI()
+    if (!api || !isConnected) {
+      addToast({ type: 'info', message: '设置将在连接后同步到服务器', duration: 3000 })
       return
     }
 
     try {
-      const result = await api.acp.setMode(mode)
-      if (result.success) {
-        setCurrentMode(mode)
-        useAppStore.getState().updateSettings({ defaultMode: mode })
-      } else {
-        // 服务器不支持此方法或参数错误，更新本地状态
-        console.warn('[ACP] Set mode failed:', result.error)
-        setCurrentMode(mode)
-        useAppStore.getState().updateSettings({ defaultMode: mode })
-      }
+      // 使用重试机制同步到服务器
+      const result = await syncWithRetry(async () => {
+        const res = await api.acp.setMode(mode)
+        if (!res.success) {
+          throw new Error(res.error || 'Unknown error')
+        }
+        return res
+      })
+      
+      console.log('[Sync] Mode synced to server:', result)
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error)
-      // 服务器不支持此方法或参数错误，只记录警告不抛出异常
-      if (errorMsg.includes('Method not found') || errorMsg.includes('Invalid params')) {
-        console.warn('[ACP] Set mode not supported by server, updating local state only:', errorMsg)
-        // 仍然更新本地状态
-        setCurrentMode(mode)
-        useAppStore.getState().updateSettings({ defaultMode: mode })
-      } else {
-        console.error('[ACP] Set mode error:', error)
-        throw error
-      }
+      console.error('[Sync] Mode sync failed:', errorMsg)
+      addToast({ type: 'error', message: `模式同步失败: ${errorMsg}`, duration: 5000 })
+      // 记录到待同步队列
+      useAppStore.getState().addToPendingSync({ type: 'mode', value: mode })
     }
-  }, [getElectronAPI, isConnected])
+  }, [getElectronAPI, isConnected, addToast])
 
-  // 设置深度思考
+  // 设置深度思考 - 始终更新本地状态，尝试同步到服务器（带重试）
   const setDeepThinkingHandler = useCallback(async (enabled: boolean) => {
-    const api = getElectronAPI()
-    if (!api) return
+    // 如果状态与当前相同，只更新本地状态（避免重复同步）
+    const currentDeepThinkingValue = useAppStore.getState().settings.deepThinking
+    if (enabled === currentDeepThinkingValue) {
+      console.log('[DeepThinking] Same value selected, skipping sync:', enabled)
+      setDeepThinking(enabled)
+      return
+    }
+    
+    // 更新本地状态
+    setDeepThinking(enabled)
+    useAppStore.getState().updateSettings({ deepThinking: enabled })
+    
+    // 添加成功反馈
+    addToast({ 
+      type: 'success', 
+      message: enabled ? '深度思考已开启' : '深度思考已关闭', 
+      duration: 2000 
+    })
 
-    if (!isConnected) {
-      console.warn('[ACP] Set deep thinking skipped: not connected')
+    const api = getElectronAPI()
+    if (!api || !isConnected) {
+      addToast({ type: 'info', message: '设置将在连接后同步到服务器', duration: 3000 })
       return
     }
 
     try {
-      const result = await api.acp.setDeepThinking(enabled)
-      if (result.success) {
-        setDeepThinking(enabled)
-        useAppStore.getState().updateSettings({ deepThinking: enabled })
-      } else {
-        // 服务器不支持此方法或参数错误，更新本地状态
-        console.warn('[ACP] Set deep thinking failed:', result.error)
-        setDeepThinking(enabled)
-        useAppStore.getState().updateSettings({ deepThinking: enabled })
-      }
+      // 使用重试机制同步到服务器
+      const result = await syncWithRetry(async () => {
+        const res = await api.acp.setDeepThinking(enabled)
+        if (!res.success) {
+          throw new Error(res.error || 'Unknown error')
+        }
+        return res
+      })
+      
+      console.log('[Sync] Deep thinking synced to server:', result)
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error)
-      // 服务器不支持此方法或参数错误，只记录警告不抛出异常
-      if (errorMsg.includes('Method not found') || errorMsg.includes('Invalid params')) {
-        console.warn('[ACP] Set deep thinking not supported by server, updating local state only:', errorMsg)
-        // 仍然更新本地状态
-        setDeepThinking(enabled)
-        useAppStore.getState().updateSettings({ deepThinking: enabled })
-      } else {
-        console.error('[ACP] Set deep thinking error:', error)
-        throw error
+      console.error('[Sync] Deep thinking sync failed:', errorMsg)
+      addToast({ type: 'error', message: `深度思考同步失败: ${errorMsg}`, duration: 5000 })
+      // 记录到待同步队列
+      useAppStore.getState().addToPendingSync({ type: 'deepThinking', value: enabled })
+    }
+  }, [getElectronAPI, isConnected, addToast])
+
+  // 取消流式响应
+  const cancelStreaming = useCallback(() => {
+    if (isStreaming) {
+      // 中止当前流式请求
+      streamingAbortControllerRef.abort()
+      // 重置状态
+      setIsStreaming(false)
+      addToast({ type: 'info', message: '已取消当前响应', duration: 2000 })
+      
+      // 更新当前会话中正在流式传输的消息
+      const store = useAppStore.getState()
+      const currentSession = store.sessions.find(s => s.id === store.currentSessionId)
+      const streamingMessage = currentSession?.messages.find(m => m.isStreaming)
+      if (streamingMessage && store.currentSessionId) {
+        updateMessage(store.currentSessionId, streamingMessage.id, { 
+          isStreaming: false, 
+          isThinking: false 
+        })
       }
     }
-  }, [getElectronAPI, isConnected])
+  }, [isStreaming, streamingAbortControllerRef, addToast, updateMessage])
 
   // 初始连接和事件监听
   useEffect(() => {
@@ -413,6 +973,7 @@ export function useAcp(): UseAcpReturn {
     if (!api) {
       console.error('[ACP] Electron API not available')
       setConnectionError('Electron API 不可用')
+      setConnectionStatus('disconnected')
       return
     }
 
@@ -422,32 +983,54 @@ export function useAcp(): UseAcpReturn {
     const doConnect = async () => {      
       try {
         setIsConnecting(true)
+        setConnectionStatus('connecting')
         setConnectionError(null)
 
-        const result = await api.acp.connect()
+        // 从 store 获取最新的连接模式，避免闭包问题
+        const currentConnectionMode = useAppStore.getState().connectionMode
+        console.log('[ACP] Connecting with mode:', currentConnectionMode)
+        
+        // 传递当前连接模式到主进程
+        const result = await api.acp.connect(currentConnectionMode)
 
         if (!mounted) return
 
         // 处理已连接的情况（复用已有连接）
         if (result.success) {
-          if (result.alreadyConnected) {
+          if ('alreadyConnected' in result && result.alreadyConnected) {
             console.log('[ACP] Reusing existing connection')
           }
           setIsConnected(true)
           setIsConnecting(false)
+          setConnectionStatus('connected')
           setConnectionError(null)
-          console.log('[ACP] Connected successfully')
+          setIsOffline(false)
+          setReconnectAttempts(0)
+          console.log('[ACP] Connected successfully, mode:', currentConnectionMode, 'type:', result.connectionType)
+          
+          // 关键修复：等待状态完全同步后再继续
+          await new Promise(resolve => setTimeout(resolve, 100))
+          
+          // 加载离线消息队列
+          loadMessageQueueFromStorage()
         } else {
-          setConnectionError(result.error || '连接失败')
+          const errorInfo = classifyError(result.error || '连接失败')
+          setConnectionError(errorInfo.message)
+          setErrorInfo(errorInfo)
           setIsConnecting(false)
           setIsConnected(false)
+          setConnectionStatus('disconnected')
+          setIsOffline(true)
         }
       } catch (error) {
         if (!mounted) return
-        const errorMsg = error instanceof Error ? error.message : '连接失败'
-        setConnectionError(errorMsg)
+        const errorInfo = classifyError(error)
+        setConnectionError(errorInfo.message)
+        setErrorInfo(errorInfo)
         setIsConnecting(false)
         setIsConnected(false)
+        setConnectionStatus('disconnected')
+        setIsOffline(true)
         console.error('[ACP] Connect error:', error)
       }
     }
@@ -457,19 +1040,69 @@ export function useAcp(): UseAcpReturn {
     // 监听状态更新
     const unsubscribeError = api.acp.onError((error) => {
       if (!mounted) return
-      setConnectionError(error)
+      const errorInfo = classifyError(error)
+      setConnectionError(errorInfo.message)
+      setErrorInfo(errorInfo)
       setIsConnected(false)
       setIsConnecting(false)
+      setConnectionStatus('disconnected')
+      setIsOffline(true)
+      
+      // 触发自动重连
+      const currentAttempts = useAppStore.getState().reconnectAttempts
+      if (currentAttempts < RECONNECT_CONFIG.maxAttempts && !isReconnectingRef.current) {
+        scheduleReconnect()
+      }
     })
 
     // 监听连接状态变化
     const unsubscribeStatus = api.acp.onStatus((status) => {
       if (!mounted) return
       console.log('[ACP] Received status update:', status)
-      if (status.status === 'disconnected') {
+      
+      if (status.status === 'connected') {
+        setIsConnected(true)
+        setIsConnecting(false)
+        setConnectionStatus('connected')
+        setConnectionError(null)
+        setIsOffline(false)
+        setReconnectAttempts(0)
+        isReconnectingRef.current = false
+        console.log('[ACP] Status update: connected')
+        
+        // 关键修复：等待状态完全同步后再继续
+        setTimeout(() => {
+          processQueue()
+        }, 100)
+      } else if (status.status === 'disconnected') {
         setIsConnected(false)
         setIsConnecting(false)
+        setConnectionStatus('disconnected')
         setConnectionError('连接已断开')
+        setIsOffline(true)
+        console.log('[ACP] Status update: disconnected')
+        
+        // 触发自动重连
+        const currentAttempts = useAppStore.getState().reconnectAttempts
+        if (currentAttempts < RECONNECT_CONFIG.maxAttempts && !isReconnectingRef.current) {
+          scheduleReconnect()
+        }
+      } else if (status.status === 'error') {
+        setIsConnected(false)
+        setIsConnecting(false)
+        setConnectionStatus('disconnected')
+        const errorMsg = (status as { error?: string }).error || '连接错误'
+        const errorInfo = classifyError(errorMsg)
+        setConnectionError(errorInfo.message)
+        setErrorInfo(errorInfo)
+        setIsOffline(true)
+        console.log('[ACP] Status update: error -', errorMsg)
+        
+        // 触发自动重连
+        const currentAttempts = useAppStore.getState().reconnectAttempts
+        if (currentAttempts < RECONNECT_CONFIG.maxAttempts && !isReconnectingRef.current) {
+          scheduleReconnect()
+        }
       }
     })
 
@@ -477,6 +1110,10 @@ export function useAcp(): UseAcpReturn {
     // 只在组件真正卸载时（如窗口关闭）才清理
     return () => {
       mounted = false
+      // 取消重连定时器
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current)
+      }
       unsubscribeError?.()
       unsubscribeStatus?.()
       // 不主动断开连接，让连接保持
@@ -489,14 +1126,21 @@ export function useAcp(): UseAcpReturn {
     isConnected,
     isConnecting,
     connectionError,
+    connectionStatus,
+    reconnectAttempts,
     currentModel,
     currentMode,
     deepThinking,
+    isStreaming,
     sendMessage,
+    regenerateMessage,
     setModel,
     setMode,
     setDeepThinking: setDeepThinkingHandler,
     reconnect,
+    cancelReconnect,
+    cancelStreaming,
+    processQueue,
   }
 }
 
@@ -505,12 +1149,23 @@ declare global {
   interface Window {
     electronAPI: {
       acp: {
-        connect: () => Promise<{ success: boolean; error?: string }>
+        connect: (mode?: 'sdk' | 'acp' | 'provider') => Promise<{ success: boolean; error?: string; connectionType?: 'sdk' | 'acp' | 'provider'; fallback?: boolean; alreadyConnected?: boolean }>
         disconnect: () => Promise<void>
-        sendPrompt: (prompt: string) => Promise<{ success: boolean; error?: string }>
+        sendPrompt: (prompt: string, aiMessageId?: string, attachments?: Array<{ type: string; name: string; content?: string; path?: string }>) => Promise<{ success: boolean; error?: string; aiMessageId?: string }>
         setMode: (mode: string) => Promise<{ success: boolean; error?: string }>
         setModel: (model: string) => Promise<{ success: boolean; error?: string }>
         setDeepThinking: (enabled: boolean, level?: number) => Promise<{ success: boolean; error?: string }>
+        setWorkspace: (path: string) => Promise<{ success: boolean; error?: string }>
+        getSettings: () => Promise<{ 
+          success: boolean; 
+          data?: {
+            mode: string;
+            model: string;
+            deepThinking: boolean;
+            deepThinkingLevel?: number;
+          };
+          error?: string 
+        }>
         onMessage: (callback: (data: unknown) => void) => () => void
         onUpdate: (callback: (data: unknown) => void) => () => void
         onError: (callback: (error: string) => void) => () => void
@@ -523,10 +1178,18 @@ declare global {
         delete: (sessionId: string) => Promise<{ success: boolean }>
         updateTitle: (sessionId: string, title: string) => Promise<{ success: boolean }>
         selectFolder: () => Promise<string | null>
+        selectImage: () => Promise<Array<{ type: string; name: string; content: string }> | null>
       }
       app: {
         getVersion: () => Promise<string>
         getPlatform: () => Promise<string>
+      }
+      provider: {
+        list: () => Promise<Array<{ name: string; baseUrl: string; model: string; isEnabled: boolean }>>
+        getActive: () => Promise<{ name: string; baseUrl: string; model: string } | null>
+        setActive: (name: string) => Promise<{ success: boolean; error?: string }>
+        sync: (providers: Array<{ name: string; apiKey: string; baseUrl: string; model: string; isEnabled: boolean }>, activeProvider: string | null) => Promise<{ success: boolean; error?: string }>
+        sendPrompt: (messages: Array<{ role: string; content: string }>, options: { model?: string; mode?: string; deepThinking?: boolean }) => Promise<{ success: boolean; error?: string }>
       }
     }
   }

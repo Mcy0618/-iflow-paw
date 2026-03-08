@@ -3,7 +3,7 @@
  * Handles JSON-RPC 2.0 communication with iFlow CLI via WebSocket
  */
 
-import { spawn, ChildProcess, exec, execSync } from 'child_process';
+import { spawn, ChildProcess, execSync } from 'child_process';
 import * as fs from 'fs';
 import * as net from 'net';
 import { EventEmitter } from 'events';
@@ -15,7 +15,6 @@ import {
   AcpConnectionState,
   AcpConnectionOptions,
   ACP_METHODS,
-  AcpInitializeParams,
   AcpInitializeResult,
   AcpNewSessionParams,
   AcpNewSessionResult,
@@ -27,7 +26,6 @@ import {
   AcpSetModelResult,
   AcpSetDeepThinkingParams,
   AcpSetDeepThinkingResult,
-  SessionUpdate,
   SupportedMode,
   SupportedModel,
 } from './types';
@@ -50,13 +48,19 @@ export class AcpConnection extends EventEmitter {
   private state: AcpConnectionState = 'disconnected';
   private pendingRequests = new Map<string, PendingRequest>();
   private sessionId: string | null = null;
-  private options: Required<AcpConnectionOptions>;
+  private options: { port: number; host: string };
+  
+  // 会话设置状态
+  private _currentMode: SupportedMode = 'Smart';
+  private _currentModel: SupportedModel = 'GLM-4.7';
+  private _deepThinkingEnabled: boolean = false;
+  private _deepThinkingLevel: number = 1;
 
   constructor(options: AcpConnectionOptions = {}) {
     super();
     this.options = {
-      port: options.port || 8090,
-      host: options.host || 'localhost',
+      port: options.port ?? 8090,
+      host: options.host ?? 'localhost',
     };
   }
 
@@ -88,6 +92,57 @@ export class AcpConnection extends EventEmitter {
       
       socket.connect(port, '127.0.0.1');
     });
+  }
+
+  /**
+   * 检测 WebSocket 服务是否真正就绪
+   * 通过尝试建立实际的 WebSocket 连接来验证服务是否可用
+   */
+  private async waitForWebSocketReady(port: number, maxWaitMs: number = 30000): Promise<boolean> {
+    const startTime = Date.now();
+    const checkInterval = 500;
+
+    console.log(`[ACP] Waiting for WebSocket to be ready on port ${port} (maxWait: ${maxWaitMs}ms)...`);
+
+    while (Date.now() - startTime < maxWaitMs) {
+      const elapsed = Date.now() - startTime;
+      // 每5秒输出一次等待进度
+      if (elapsed % 5000 < checkInterval) {
+        console.log(`[ACP] Still waiting for WebSocket... (${elapsed}ms / ${maxWaitMs}ms)`);
+      }
+
+      try {
+        // 尝试建立实际的 WebSocket 连接
+        const testWs = new WebSocket(`ws://127.0.0.1:${port}/acp?peer=test`);
+
+        await new Promise<void>((resolve, reject) => {
+          const timeout = setTimeout(() => {
+            testWs.terminate();
+            reject(new Error('Test connection timeout'));
+          }, 2000);
+
+          testWs.on('open', () => {
+            clearTimeout(timeout);
+            testWs.close();
+            resolve();
+          });
+
+          testWs.on('error', () => {
+            clearTimeout(timeout);
+            reject(new Error('Test connection failed'));
+          });
+        });
+
+        console.log(`[ACP] WebSocket is ready after ${Date.now() - startTime}ms`);
+        return true;
+      } catch {
+        // WebSocket 未就绪，继续等待
+        await new Promise(r => setTimeout(r, checkInterval));
+      }
+    }
+
+    console.error(`[ACP] WebSocket failed to become ready within ${maxWaitMs}ms`);
+    return false;
   }
 
   async connect(): Promise<void> {
@@ -125,21 +180,27 @@ export class AcpConnection extends EventEmitter {
         await this.connectWebSocket();
       }
       
-      // 等待 //ready 消息
-      await new Promise<void>((resolve) => {
+      // 等待 //ready 消息 - 关键修复：必须收到 ready 消息才能继续
+      await new Promise<void>((resolve, reject) => {
         const handler = (message: string) => {
           if (message === 'ready') {
+            console.log('[ACP] Received ready message from server');
             this.off('ready', handler);
             resolve();
           }
         };
         this.on('ready', handler);
         
-        // 超时保护
-        setTimeout(() => {
+        // 超时保护 - 必须收到 ready 才能继续，否则 reject
+        const timeout = setTimeout(() => {
           this.off('ready', handler);
-          resolve(); // 即使没有收到 ready 消息也继续
-        }, 5000);
+          reject(new Error('Server ready message timeout - server may not be fully initialized'));
+        }, 10000); // 增加超时时间到 10 秒
+        
+        // 清理函数
+        const cleanup = () => clearTimeout(timeout);
+        this.once('error', cleanup);
+        this.once('disconnected', cleanup);
       });
       
       this.setState('connected');
@@ -223,7 +284,7 @@ export class AcpConnection extends EventEmitter {
     }
 
     // Reject all pending requests
-    for (const [id, request] of this.pendingRequests) {
+    for (const [_id, request] of this.pendingRequests) {
       clearTimeout(request.timeout);
       request.reject(new Error('Connection closed'));
     }
@@ -245,6 +306,7 @@ export class AcpConnection extends EventEmitter {
    * Unix: 使用 SIGKILL
    * 
    * 关键修复：使用同步方式确保进程在应用退出前被终止
+   * 关键修复：使用 encoding: 'buffer' 避免中文乱码问题
    */
   private forceKillProcess(pid: number | undefined): void {
     if (!pid) return;
@@ -254,16 +316,38 @@ export class AcpConnection extends EventEmitter {
     if (process.platform === 'win32') {
       // Windows: 使用同步方式终止进程树，确保在应用退出前完成
       // /F = 强制终止, /T = 终止指定进程及其子进程
+      // 关键修复：使用 encoding: 'buffer' 避免中文编码问题
       try {
-        execSync(`taskkill /pid ${pid} /F /T`, { 
+        const output = execSync(`taskkill /pid ${pid} /F /T`, { 
           timeout: 5000,
-          encoding: 'utf-8'
+          encoding: 'buffer',
+          windowsHide: true
         });
-        console.log(`[ACP] Process tree ${pid} force killed successfully`);
-      } catch (error) {
-        // 进程可能已经不存在，忽略错误
-        const errorMsg = error instanceof Error ? error.message : String(error);
-        if (!errorMsg.includes('未找到') && !errorMsg.includes('not found')) {
+        console.log(`[ACP] Process tree ${pid} force killed successfully:`, output.toString('utf8').trim());
+      } catch (error: any) {
+        // 进程可能已经不存在，忽略这些常见错误
+        // 关键修复：处理 buffer 输出的错误信息
+        let errorMsg: string;
+        if (error?.stderr) {
+          errorMsg = error.stderr.toString('utf8');
+        } else if (error?.message) {
+          errorMsg = error.message;
+        } else {
+          errorMsg = String(error);
+        }
+        
+        const ignorablePatterns = [
+          '未找到', '没有找到',           // 中文：进程未找到
+          'not found', 'no such process', // 英文：进程不存在
+          'ESRCH',                         // 系统错误码：进程不存在
+          '进程不在',                       // 中文变体
+          'has already been',              // 进程已被终止
+          '已经终止',                       // 中文变体
+        ];
+        const shouldIgnore = ignorablePatterns.some(pattern => 
+          errorMsg.toLowerCase().includes(pattern.toLowerCase())
+        );
+        if (!shouldIgnore) {
           console.error('[ACP] forceKill warning:', errorMsg);
         }
       }
@@ -398,8 +482,9 @@ export class AcpConnection extends EventEmitter {
         reject(new Error(`Failed to spawn process: ${error.message}`));
       });
 
-      // Wait for the process to start, give server enough time to fully start
-      console.log('[ACP] Waiting for server to start (10s)...');
+      // Wait for the process to start, with dynamic port detection
+      // Increased from 25s to 30s to provide more buffer time
+      console.log('[ACP] Waiting for server to start...');
       
       // 使用 try-finally 确保定时器被正确清理
       let checkInterval: NodeJS.Timeout | null = null;
@@ -417,21 +502,48 @@ export class AcpConnection extends EventEmitter {
         }
       };
       
-      // 检查进程是否仍在运行
-      checkInterval = setInterval(() => {
+      // 检查进程是否仍在运行 + WebSocket 是否就绪
+      checkInterval = setInterval(async () => {
         if (this.process?.killed && !settled) {
           cleanupTimers();
           reject(new Error('iflow process exited prematurely'));
+          return;
         }
-      }, 500);
+        
+        // 首先检测 TCP 端口是否可连接
+        const portReady = await this.checkPortInUse(this.options.port);
+        if (portReady && !settled) {
+          console.log('[ACP] TCP port is ready, checking WebSocket...');
+          
+          // 关键修复：等待 WebSocket 真正就绪（超时增加到20秒）
+          const wsReady = await this.waitForWebSocketReady(this.options.port, 20000);
+          if (wsReady && !settled) {
+            cleanupTimers();
+            settled = true;
+            console.log('[ACP] WebSocket is ready, server startup complete');
+            resolve();
+          }
+          // 如果 WebSocket 未就绪，继续等待下一次检查
+        }
+      }, 1000);
       
+      // 30秒总超时
       startupTimeout = setTimeout(() => {
         if (!settled) {
           cleanupTimers();
-          console.log('[ACP] Server should be ready now');
-          resolve();
+          settled = true;
+          console.error('[ACP] Server startup timeout after 30000ms');
+          
+          // 超时后强制终止进程
+          if (this.process && !this.process.killed) {
+            console.log('[ACP] Force killing process due to startup timeout');
+            const pid = this.process.pid;
+            this.forceKillProcess(pid);
+          }
+          
+          reject(new Error('Server startup timeout - process did not become ready within 30 seconds'));
         }
-      }, 10000);
+      }, 30000);
     });
   }
 
@@ -443,15 +555,17 @@ export class AcpConnection extends EventEmitter {
     return new Promise((resolve, reject) => {
       // 强制使用 IPv4 地址，避免 IPv6 解析问题
       const url = `ws://127.0.0.1:${this.options.port}/acp?peer=iflow`;
-      
+
       console.log(`[ACP] Attempting to connect to: ${url}`);
+      const connectStartTime = Date.now();
       this.ws = new WebSocket(url);
-      
+
       console.log(`[ACP] WebSocket created, readyState: ${this.ws.readyState}`);
       console.log(`[ACP] CONNECTING=${WebSocket.CONNECTING}, OPEN=${WebSocket.OPEN}`);
 
       this.ws.on('open', () => {
-        console.log('[ACP] WebSocket connected successfully');
+        const connectTime = Date.now() - connectStartTime;
+        console.log(`[ACP] WebSocket connected successfully in ${connectTime}ms`);
         resolve();
       });
 
@@ -469,11 +583,11 @@ export class AcpConnection extends EventEmitter {
           const message = JSON.parse(messageText) as JsonRpcResponse | JsonRpcNotification;
           this.handleMessage(message);
         } catch (error) {
-          console.error('[ACP] Failed to parse WebSocket message:', error.message);
+          console.error('[ACP] Failed to parse WebSocket message:', error instanceof Error ? error.message : String(error));
         }
       });
 
-      this.ws.on('error', (error) => {
+      this.ws.on('error', (error: Error) => {
         // 捕获 WebSocket 错误，避免未处理的异常
         console.error('[ACP] WebSocket error:', error instanceof Error ? error.message : String(error));
         if (this.state === 'connecting') {
@@ -481,19 +595,19 @@ export class AcpConnection extends EventEmitter {
         }
       });
 
-      this.ws.on('close', (code, reason) => {
+      this.ws.on('close', (code: number, reason: Buffer) => {
         console.log(`[ACP] WebSocket closed: ${code} - ${reason}`);
         if (this.state !== 'disconnected') {
           this.disconnect();
         }
       });
 
-      // Timeout after 10 seconds
+      // Timeout after 30 seconds (增加超时时间到30秒)
       setTimeout(() => {
         if (this.ws?.readyState !== WebSocket.OPEN) {
-          reject(new Error('WebSocket connection timeout'));
+          reject(new Error('WebSocket connection timeout (30s)'));
         }
-      }, 15000); // 增加超时时间到 15 秒
+      }, 30000);
     });
   }
 
@@ -512,12 +626,10 @@ export class AcpConnection extends EventEmitter {
   }
 
   private handleResponse(response: JsonRpcResponse): void {
-    console.log('[ACP] Received response for request:', response.id, 
-      response.error ? `Error: ${response.error.code} - ${response.error.message}` : 'Success');
-    
     const pending = this.pendingRequests.get(String(response.id));
+
     if (!pending) {
-      console.warn('[ACP] Received response for unknown request:', response.id);
+      console.warn('[ACP] Received response for unknown/expired request:', response.id);
       return;
     }
 
@@ -578,9 +690,18 @@ export class AcpConnection extends EventEmitter {
   }
 
   private sendRequest<T = unknown>(method: string, params?: Record<string, unknown>): Promise<T> {
+    return this.sendRequestWithTimeout(method, params, 60000); // 默认超时增加到60秒
+  }
+
+  private sendRequestWithTimeout<T = unknown>(
+    method: string,
+    params?: Record<string, unknown>,
+    timeoutMs: number = 60000
+  ): Promise<T> {
     return new Promise((resolve, reject) => {
       // 检查 WebSocket 连接状态
       if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+        console.error(`[ACP] Cannot send request ${method}: WebSocket not connected (state: ${this.ws?.readyState})`);
         reject(new Error('WebSocket not connected'));
         return;
       }
@@ -593,17 +714,24 @@ export class AcpConnection extends EventEmitter {
         params,
       };
 
-      console.log(`[ACP] Sending request:`, { id, method, params });
+      const requestStartTime = Date.now();
+      console.log(`[ACP] Sending request:`, { id, method, timeout: timeoutMs });
 
       const timeout = setTimeout(() => {
+        const elapsed = Date.now() - requestStartTime;
         this.pendingRequests.delete(id);
-        reject(new Error(`Request timeout: ${method}`));
-      }, 30000);
+        console.error(`[ACP] Request timeout after ${elapsed}ms: ${method} (timeout: ${timeoutMs}ms)`);
+        reject(new Error(`Request timeout: ${method} (elapsed: ${elapsed}ms, timeout: ${timeoutMs}ms)`));
+      }, timeoutMs);
 
-      this.pendingRequests.set(id, { resolve, reject, timeout });
+      this.pendingRequests.set(id, { 
+        resolve: resolve as (value: unknown) => void, 
+        reject, 
+        timeout 
+      });
 
       try {
-        this.ws.send(JSON.stringify(request), (error) => {
+        this.ws.send(JSON.stringify(request), (error?: Error) => {
           if (error) {
             clearTimeout(timeout);
             this.pendingRequests.delete(id);
@@ -623,28 +751,68 @@ export class AcpConnection extends EventEmitter {
   // ACP Methods
   // ========================================================================
 
+  private initializeResult: AcpInitializeResult | null = null;
+
   async initialize(): Promise<AcpInitializeResult> {
+    // 防止重复初始化
+    if (this.state === 'connected' && this.initializeResult) {
+      console.log('[ACP] Already initialized, returning cached result');
+      return this.initializeResult;
+    }
+    
+    // 如果正在初始化中，等待完成
+    if (this.state === 'initializing') {
+      console.log('[ACP] Initialization already in progress, waiting...');
+      return new Promise((resolve, reject) => {
+        const checkInterval = setInterval(() => {
+          if (this.state === 'connected' && this.initializeResult) {
+            clearInterval(checkInterval);
+            resolve(this.initializeResult);
+          } else if (this.state === 'error') {
+            clearInterval(checkInterval);
+            reject(new Error('Initialization failed'));
+          }
+        }, 100);
+        
+        // 60秒超时
+        setTimeout(() => {
+          clearInterval(checkInterval);
+          reject(new Error('Initialization wait timeout'));
+        }, 60000);
+      });
+    }
+
     this.setState('initializing');
 
-    // Use iflow cli expected format (protocolVersion as number, clientCapabilities)
-    const params = {
-      protocolVersion: 1,
-      clientInfo: {
-        name: 'iflow-paw',
-        version: '1.0.0',
-      },
-      clientCapabilities: {
-        fs: { readTextFile: true, writeTextFile: true }
-      },
-    };
+    try {
+      // Use iflow cli expected format (protocolVersion as number, clientCapabilities)
+      const params = {
+        protocolVersion: 1,
+        clientInfo: {
+          name: 'iflow-paw',
+          version: '1.0.0',
+        },
+        clientCapabilities: {
+          fs: { readTextFile: true, writeTextFile: true }
+        },
+      };
 
-    const result = await this.sendRequest(
-      ACP_METHODS.INITIALIZE,
-      params
-    ) as AcpInitializeResult;
+      // 增加超时时间到 60 秒
+      const result = await this.sendRequestWithTimeout(
+        ACP_METHODS.INITIALIZE,
+        params,
+        60000
+      ) as AcpInitializeResult;
 
-    console.log('[ACP] Initialized:', result.serverInfo || result);
-    return result;
+      // 关键修复：初始化成功后更新状态
+      this.initializeResult = result;
+      this.setState('connected');
+      console.log('[ACP] Initialized successfully:', result.serverInfo || result);
+      return result;
+    } catch (error) {
+      this.setState('error');
+      throw error;
+    }
   }
 
   async newSession(params: AcpNewSessionParams): Promise<AcpNewSessionResult> {
@@ -652,11 +820,27 @@ export class AcpConnection extends EventEmitter {
     // Generate a session ID if not provided
     const sessionId = params.sessionId || `session-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     
-    // cwd is required by iflow cli
-    const requestParams: { sessionId: string; cwd: string } = {
+    // 构建 session/load 请求参数
+    // 尝试传递 model 和 deepThinking 参数（如果服务器支持）
+    const requestParams: { sessionId: string; cwd: string; model?: string; deepThinking?: boolean; deepThinkingLevel?: number } = {
       sessionId,
       cwd: params.workingDir || process.cwd()
     };
+    
+    // 尝试传递模型参数（如果服务器支持）
+    if (params.options && params.options.model) {
+      requestParams.model = params.options.model;
+      console.log('[ACP] Including model in session/load:', params.options.model);
+    }
+    
+    // 尝试传递深度思考参数（如果服务器支持）
+    if (params.options && params.options.deepThinking !== undefined) {
+      requestParams.deepThinking = params.options.deepThinking;
+      if (params.options.deepThinkingLevel !== undefined) {
+        requestParams.deepThinkingLevel = params.options.deepThinkingLevel;
+      }
+      console.log('[ACP] Including deepThinking in session/load:', params.options.deepThinking);
+    }
     
     const result = await this.sendRequest(
       ACP_METHODS.SESSION_LOAD,
@@ -665,35 +849,159 @@ export class AcpConnection extends EventEmitter {
 
     this.sessionId = result.sessionId || sessionId;
     console.log('[ACP] Session loaded/created:', this.sessionId);
+    
+    // 更新本地设置
+    if (params.options) {
+      const options = params.options;
+      
+      // 更新本地模型状态
+      if (options.model) {
+        this._currentModel = options.model as SupportedModel;
+        console.log('[ACP] Local model updated:', options.model);
+      }
+      
+      // 更新本地深度思考状态
+      if (options.deepThinking !== undefined) {
+        this._deepThinkingEnabled = options.deepThinking;
+        if (options.deepThinkingLevel !== undefined) {
+          this._deepThinkingLevel = options.deepThinkingLevel;
+        }
+        console.log('[ACP] Local deepThinking updated:', options.deepThinking);
+      }
+      
+      // 设置模式（支持服务器同步）
+      if (options.mode) {
+        console.log('[ACP] Setting mode:', options.mode);
+        await this.setMode({ mode: options.mode });
+      }
+    }
+    
     return result;
   }
 
   async prompt(params: AcpPromptParams): Promise<AcpPromptResult> {
     return await this.sendRequest(
       ACP_METHODS.SESSION_PROMPT,
-      params
+      params as unknown as Record<string, unknown>
     ) as AcpPromptResult;
   }
 
   async setMode(params: AcpSetModeParams): Promise<AcpSetModeResult> {
-    return await this.sendRequest(
+    // 更新本地状态
+    const previousMode = this._currentMode;
+    this._currentMode = params.mode as SupportedMode;
+    
+    // 如果没有活跃 session，只更新本地状态，不发送请求
+    if (!this.sessionId) {
+      console.log('[ACP] No active session, updating local mode only:', params.mode);
+      return { success: true, previousMode, currentMode: this._currentMode };
+    }
+    
+    // 将模式名称转换为小写，匹配 iflow CLI 服务器期望的格式
+    // 服务器接受: yolo, smart, plan, default
+    const modeMap: Record<string, string> = {
+      'YOLO': 'yolo',
+      'Plan': 'plan',
+      'Smart': 'smart',
+      'Ask': 'default',
+    };
+    const serverModeId = modeMap[params.mode] || params.mode.toLowerCase();
+    
+    const requestParams = {
+      sessionId: this.sessionId,
+      modeId: serverModeId,
+    };
+    const result = await this.sendRequest(
       ACP_METHODS.SESSION_SET_MODE,
-      params
+      requestParams
     ) as AcpSetModeResult;
+    return result;
   }
 
   async setModel(params: AcpSetModelParams): Promise<AcpSetModelResult> {
-    return await this.sendRequest(
-      ACP_METHODS.SESSION_SET_MODEL,
-      params
-    ) as AcpSetModelResult;
+    // 更新本地状态
+    const previousModel = this._currentModel;
+    this._currentModel = params.model as SupportedModel;
+    let serverSynced = false;
+
+    // 如果会话已创建，尝试发送 session/set_config_option 请求到服务器
+    // 这样可以让服务器端的模型设置立即生效
+    if (this.sessionId) {
+      try {
+        const requestParams = {
+          sessionId: this.sessionId,
+          options: {
+            model: params.model,
+          },
+        };
+        await this.sendRequest(ACP_METHODS.SESSION_SET_CONFIG_OPTION, requestParams);
+        serverSynced = true;
+        console.log('[ACP] Model updated on server:', params.model);
+      } catch (error) {
+        // 服务器调用失败不影响本地状态，保持向后兼容
+        // 模型设置会在下次 prompt 时通过会话配置生效
+        console.error(
+          `[ACP] Model updated locally (server call failed): ${params.model}`,
+          error instanceof Error ? error.message : String(error)
+        );
+      }
+    } else {
+      // 会话未创建，只更新本地状态
+      console.log('[ACP] Model updated locally (no session):', params.model);
+    }
+
+    return { success: true, previousModel, currentModel: this._currentModel, serverSynced };
   }
 
   async setDeepThinking(params: AcpSetDeepThinkingParams): Promise<AcpSetDeepThinkingResult> {
-    return await this.sendRequest(
-      ACP_METHODS.SESSION_SET_DEEP_THINKING,
-      params
-    ) as AcpSetDeepThinkingResult;
+    // 更新本地状态
+    this._deepThinkingEnabled = params.enabled;
+    if (params.level !== undefined) {
+      this._deepThinkingLevel = params.level;
+    }
+
+    // 如果会话已创建，尝试发送 session/set_config_option 请求到服务器
+    // 这样可以让服务器端的深度思考设置立即生效
+    let serverSynced = false;
+    if (this.sessionId) {
+      try {
+        const requestParams = {
+          sessionId: this.sessionId,
+          options: {
+            deepThinking: params.enabled,
+            ...(params.level !== undefined && { deepThinkingLevel: params.level }),
+          },
+        };
+        await this.sendRequest(ACP_METHODS.SESSION_SET_CONFIG_OPTION, requestParams);
+        console.log('[ACP] DeepThinking updated on server:', params.enabled, 'level:', this._deepThinkingLevel);
+        serverSynced = true;
+      } catch (error) {
+        // 服务器调用失败不影响本地状态，保持向后兼容
+        // 深度思考设置会在下次 prompt 时通过会话配置生效
+        console.log('[ACP] DeepThinking updated locally (server call failed):', params.enabled);
+      }
+    } else {
+      // 会话未创建，只更新本地状态
+      console.log('[ACP] DeepThinking updated locally (no session):', params.enabled);
+    }
+
+    return {
+      success: true,
+      enabled: params.enabled,
+      level: this._deepThinkingLevel,
+      serverSynced,
+    };
+  }
+
+  // ========================================================================
+  // IConnection Interface Methods
+  // ========================================================================
+
+  /**
+   * 发送 Prompt 请求 (IConnection 接口)
+   */
+  async sendPrompt(params: AcpPromptParams): Promise<AcpPromptResult> {
+    return this.prompt(params);
   }
 
   // ========================================================================
@@ -710,5 +1018,22 @@ export class AcpConnection extends EventEmitter {
 
   get currentSessionId(): string | null {
     return this.sessionId;
+  }
+
+  // 会话设置 getters
+  getCurrentMode(): SupportedMode {
+    return this._currentMode;
+  }
+
+  getCurrentModel(): SupportedModel {
+    return this._currentModel;
+  }
+
+  isDeepThinkingEnabled(): boolean {
+    return this._deepThinkingEnabled;
+  }
+
+  getDeepThinkingLevel(): number {
+    return this._deepThinkingLevel;
   }
 }
