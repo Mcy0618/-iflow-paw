@@ -280,8 +280,25 @@ function App() {
                   : 'bg-white hover:bg-red-50 text-red-600 border border-red-100'
               }`}
             >
-              重试
+              重连
             </button>
+          </div>
+        )}
+
+        {/* 重连中状态 */}
+        {connectionStatus === 'reconnecting' && (
+          <div className={`px-4 py-2.5 border-b flex items-center justify-between animate-fade-in ${
+            isDark 
+              ? 'bg-gradient-to-r from-amber-950/50 to-orange-950/50 border-amber-900/50' 
+              : 'bg-gradient-to-r from-amber-50 to-orange-50 border-amber-100'
+          }`}>
+            <div className={`flex items-center gap-2 text-sm font-medium ${
+              isDark ? 'text-amber-400' : 'text-amber-600'
+            }`}>
+              <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
+              正在重连...
+              <span className="text-xs opacity-75">(点击右上角取消)</span>
+            </div>
           </div>
         )}
 

@@ -6,7 +6,7 @@ import type { Toast } from '../components/Toast'
 export type Theme = 'light' | 'dark' | 'system'
 
 // 连接模式类型
-export type ConnectionMode = 'sdk' | 'acp' | 'provider'
+export type ConnectionMode = 'sdk' | 'acp'
 
 // 连接状态
 export type ConnectionStatus = 'connected' | 'connecting' | 'reconnecting' | 'disconnected'
@@ -38,15 +38,6 @@ export interface ErrorInfo {
   type: ErrorType
   message: string
   originalError?: unknown
-}
-
-// Provider 配置
-export interface ProviderConfig {
-  name: string
-  apiKey: string
-  baseUrl: string
-  model: string
-  isEnabled: boolean
 }
 
 export interface Attachment {
@@ -105,10 +96,6 @@ export interface AppState {
   theme: Theme
   resolvedTheme: 'light' | 'dark' // 实际解析后的主题
   
-  // Provider 配置
-  providers: ProviderConfig[]
-  activeProvider: string | null
-  
   // 全局设置
   settings: {
     defaultModel: string
@@ -155,13 +142,6 @@ export interface AppState {
   setTheme: (theme: Theme) => void
   setResolvedTheme: (theme: 'light' | 'dark') => void
   
-  // Provider 操作
-  setProviders: (providers: ProviderConfig[]) => void
-  addProvider: (provider: ProviderConfig) => void
-  updateProvider: (name: string, updates: Partial<ProviderConfig>) => void
-  removeProvider: (name: string) => void
-  setActiveProvider: (name: string | null) => void
-  
   updateSettings: (settings: Partial<AppState['settings']>) => void
   
   // 工具方法
@@ -200,10 +180,6 @@ export const useAppStore = create<AppState>()(
       // 主题初始状态
       theme: 'system',
       resolvedTheme: 'light',
-      
-      // Provider 初始状态
-      providers: [],
-      activeProvider: null,
       
       settings: {
         defaultModel: 'GLM-4.7',
@@ -408,26 +384,6 @@ export const useAppStore = create<AppState>()(
       setTheme: (theme) => set({ theme }),
       setResolvedTheme: (resolvedTheme) => set({ resolvedTheme }),
       
-      // Provider 操作
-      setProviders: (providers) => set({ providers }),
-      
-      addProvider: (provider) => set((state) => ({
-        providers: [...state.providers, provider],
-      })),
-      
-      updateProvider: (name, updates) => set((state) => ({
-        providers: state.providers.map((p) =>
-          p.name === name ? { ...p, ...updates } : p
-        ),
-      })),
-      
-      removeProvider: (name) => set((state) => ({
-        providers: state.providers.filter((p) => p.name !== name),
-        activeProvider: state.activeProvider === name ? null : state.activeProvider,
-      })),
-      
-      setActiveProvider: (name) => set({ activeProvider: name }),
-
       // 设置
       updateSettings: (newSettings) => set((state) => ({
         settings: { ...state.settings, ...newSettings },
@@ -501,8 +457,6 @@ export const useAppStore = create<AppState>()(
         currentSessionId: state.currentSessionId,
         settings: state.settings,
         theme: state.theme,
-        providers: state.providers,
-        activeProvider: state.activeProvider,
         connectionMode: state.connectionMode,
       }),
     }
@@ -589,16 +543,6 @@ export const useCurrentSessionId = () => {
  */
 export const useSettings = () => {
   return useAppStore((state) => state.settings)
-}
-
-/**
- * 获取 Providers - 只在 providers 变化时更新
- */
-export const useProviders = () => {
-  return useAppStore((state) => ({
-    providers: state.providers,
-    activeProvider: state.activeProvider,
-  }))
 }
 
 /**

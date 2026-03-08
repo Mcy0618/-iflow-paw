@@ -430,21 +430,72 @@ export class SdkClient extends EventEmitter implements IConnection {
         message.includes('timed out') ||
         stack.includes('timeout')) {
       return new TimeoutError(
-        `Connection timeout: ${error.message}`,
+        `连接超时: ${error.message}`,
         error
       );
     }
     
-    // 连接错误
+    // 连接错误 - 连接被拒绝
     if (message.includes('econnrefused') ||
-        message.includes('connection refused') ||
-        message.includes('etimedout') ||
-        message.includes('connection closed') ||
-        message.includes('connection lost') ||
-        message.includes('failed to start iflow') ||
-        message.includes('port 8090')) {
+        message.includes('connection refused')) {
       return new ConnectionError(
-        `Connection failed: ${error.message}`,
+        `连接被拒绝: iFlow CLI 端口 8090 无响应，请确保 iFlow CLI 正在运行`,
+        error
+      );
+    }
+    
+    // 连接错误 - 连接超时
+    if (message.includes('etimedout') ||
+        message.includes('connection timed out')) {
+      return new ConnectionError(
+        `连接超时: 无法连接到 iFlow CLI，请检查网络或防火墙设置`,
+        error
+      );
+    }
+    
+    // 连接错误 - 连接关闭
+    if (message.includes('connection closed') ||
+        message.includes('connection lost')) {
+      return new ConnectionError(
+        `连接已关闭: 与 iFlow CLI 的连接意外中断`,
+        error
+      );
+    }
+    
+    // 启动错误 - iFlow 启动失败
+    if (message.includes('failed to start iflow') ||
+        message.includes('failed to start')) {
+      return new ConnectionError(
+        `启动失败: 无法启动 iFlow CLI，请检查安装是否正确`,
+        error
+      );
+    }
+    
+    // 端口错误
+    if (message.includes('port 8090') ||
+        message.includes('port')) {
+      return new ConnectionError(
+        `端口错误: 端口 8090 可能被其他程序占用`,
+        error
+      );
+    }
+    
+    // 工作目录错误
+    if (message.includes('ENOENT') ||
+        message.includes('not found') ||
+        message.includes('working directory')) {
+      return new ConnectionError(
+        `工作目录错误: 指定的工作目录不存在或无法访问`,
+        error
+      );
+    }
+    
+    // 权限错误
+    if (message.includes('permission') ||
+        message.includes('access denied') ||
+        message.includes('eacces')) {
+      return new ConnectionError(
+        `权限错误: 无法访问工作目录，请检查目录权限`,
         error
       );
     }

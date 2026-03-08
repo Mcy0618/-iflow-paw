@@ -1,10 +1,9 @@
 import React, { Fragment } from 'react'
 import { Dialog, Transition, Tab } from '@headlessui/react'
-import { XMarkIcon, SunIcon, LinkIcon, ServerIcon, FolderIcon } from '@heroicons/react/24/outline'
+import { XMarkIcon, SunIcon, LinkIcon, FolderIcon } from '@heroicons/react/24/outline'
 import { useTheme } from '../../hooks/useTheme'
 import { AppearancePanel } from './AppearancePanel'
 import { ConnectionPanel } from './ConnectionPanel'
-import { ProviderPanel } from './ProviderPanel'
 import { GeneralPanel } from './GeneralPanel'
 
 interface SettingsProps {
@@ -119,22 +118,6 @@ export const Settings: React.FC<SettingsProps> = ({ isOpen, onClose }) => {
                               ? 'text-slate-400 hover:text-slate-200' 
                               : 'text-slate-500 hover:text-slate-700'
                         }`}>
-                          <ServerIcon className="w-4 h-4" />
-                          Provider
-                        </button>
-                      )}
-                    </Tab>
-                    <Tab as={Fragment}>
-                      {({ selected }) => (
-                        <button className={`flex items-center gap-2 px-5 py-3 text-sm font-medium transition-colors ${
-                          selected 
-                            ? isDark 
-                              ? 'text-primary-400 border-b-2 border-primary-400' 
-                              : 'text-primary-600 border-b-2 border-primary-600'
-                            : isDark 
-                              ? 'text-slate-400 hover:text-slate-200' 
-                              : 'text-slate-500 hover:text-slate-700'
-                        }`}>
                           <FolderIcon className="w-4 h-4" />
                           通用
                         </button>
@@ -148,9 +131,6 @@ export const Settings: React.FC<SettingsProps> = ({ isOpen, onClose }) => {
                     </Tab.Panel>
                     <Tab.Panel>
                       <ConnectionPanel />
-                    </Tab.Panel>
-                    <Tab.Panel>
-                      <ProviderPanel />
                     </Tab.Panel>
                     <Tab.Panel>
                       <GeneralPanel />
@@ -171,5 +151,4 @@ export default Settings
 // 导出子组件
 export { AppearancePanel } from './AppearancePanel'
 export { ConnectionPanel } from './ConnectionPanel'
-export { ProviderPanel } from './ProviderPanel'
 export { GeneralPanel } from './GeneralPanel'

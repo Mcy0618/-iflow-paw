@@ -7,9 +7,8 @@ interface ConnectionPanelProps {
 }
 
 const connectionModeOptions: { value: ConnectionMode; label: string; desc: string }[] = [
-  { value: 'sdk', label: 'SDK', desc: 'iFlow CLI SDK (自动降级到 ACP)' },
+  { value: 'sdk', label: 'SDK', desc: 'iFlow CLI SDK (推荐)' },
   { value: 'acp', label: 'ACP', desc: '直接使用 ACP WebSocket' },
-  { value: 'provider', label: 'Provider', desc: '使用第三方 API' },
 ]
 
 /**
@@ -22,8 +21,8 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ className = ''
     setConnectionMode,
     isConnected,
     connectionError,
-    activeProvider,
-    providers,
+    connectionStatus,
+    reconnectAttempts,
   } = useAppStore()
 
   return (
@@ -97,7 +96,7 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ className = ''
           <div className="flex items-center gap-3">
             <div className={`w-3 h-3 rounded-full ${
               connectionError 
-                ? 'bg-red-500' 
+                ? 'bg-red-500 animate-pulse' 
                 : isConnected 
                   ? 'bg-green-500' 
                   : 'bg-yellow-500'
@@ -108,32 +107,24 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({ className = ''
               {connectionError 
                 ? `连接错误: ${connectionError}` 
                 : isConnected 
-                  ? '已连接' 
-                  : '未连接'}
+                  ? '已连接'
+                  : connectionStatus === 'connecting'
+                    ? '连接中...'
+                    : connectionStatus === 'reconnecting'
+                      ? '重连中...'
+                      : '未连接'}
             </span>
           </div>
-          {connectionMode === 'provider' && activeProvider && (
-            <div className={`mt-2 text-xs ${
+          {/* 显示重连次数 */}
+          {connectionStatus === 'reconnecting' && reconnectAttempts > 0 && (
+            <span className={`text-xs ${
               isDark ? 'text-slate-500' : 'text-slate-400'
             }`}>
-              当前 Provider: {activeProvider}
-            </div>
+              尝试 {reconnectAttempts}/3
+            </span>
           )}
         </div>
       </div>
-
-      {/* Provider 模式提示 */}
-      {connectionMode === 'provider' && providers.length === 0 && (
-        <div className={`p-4 rounded-xl border ${
-          isDark 
-            ? 'bg-yellow-900/20 border-yellow-800/50 text-yellow-400' 
-            : 'bg-yellow-50 border-yellow-200 text-yellow-700'
-        }`}>
-          <p className="text-sm">
-            Provider 模式需要至少配置一个 Provider。请切换到 Provider 标签页添加配置。
-          </p>
-        </div>
-      )}
     </div>
   )
 }

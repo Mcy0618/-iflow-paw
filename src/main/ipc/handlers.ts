@@ -513,15 +513,58 @@ export function registerIpcHandlers(window: BrowserWindow): void {
       };
     } catch (error) {
       console.error('[Connection Handler] Connect error:', error);
-      connection?.disconnect();
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      const errorCode = getConnectionErrorCode(error);
+      
+      // 发送错误状态到前端
+      notifyRenderer('acp:status', { status: 'error', error: errorMessage, code: errorCode });
+      
+      // 清理连接
+      try {
+        await connection?.disconnect();
+      } catch (e) {
+        console.error('[Connection Handler] Error cleaning up connection:', e);
+      }
       connection = null;
       acpConnection = null;
       connectionType = null;
+      
       return {
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error',
+        error: errorMessage,
+        code: errorCode,
       };
     }
+  }
+
+  /**
+   * 获取连接错误码
+   */
+  function getConnectionErrorCode(error: unknown): string {
+    const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+    
+    if (message.includes('econnrefused') || message.includes('connection refused')) {
+      return 'CONNECTION_REFUSED';
+    }
+    if (message.includes('timeout') || message.includes('timed out')) {
+      return 'CONNECTION_TIMEOUT';
+    }
+    if (message.includes('port 8090') || message.includes('port')) {
+      return 'PORT_IN_USE';
+    }
+    if (message.includes('not found') || message.includes('ENOENT')) {
+      return 'NOT_FOUND';
+    }
+    if (message.includes('permission') || message.includes('access denied')) {
+      return 'PERMISSION_DENIED';
+    }
+    if (message.includes('workspace') || message.includes('workingdir')) {
+      return 'INVALID_WORKSPACE';
+    }
+    if (message.includes('sdk')) {
+      return 'SDK_ERROR';
+    }
+    return 'UNKNOWN_ERROR';
   }
 
   ipcMain.handle('acp:disconnect', async () => {
@@ -623,12 +666,40 @@ export function registerIpcHandlers(window: BrowserWindow): void {
       return { success: true, data: result, aiMessageId: currentStreamingMessageId };
     } catch (error) {
       console.error('[Handler] acp:sendPrompt final error:', error);
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      const errorCode = getPromptErrorCode(error);
+      
+      // 发送错误状态到前端
+      notifyRenderer('acp:status', { status: 'error', error: errorMessage, code: errorCode });
+      
       return {
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error',
+        error: errorMessage,
+        code: errorCode,
       };
     }
   });
+
+  /**
+   * 获取发送提示错误码
+   */
+  function getPromptErrorCode(error: unknown): string {
+    const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+    
+    if (message.includes('not connected') || message.includes('connection state')) {
+      return 'NOT_CONNECTED';
+    }
+    if (message.includes('no active session') || message.includes('session')) {
+      return 'NO_SESSION';
+    }
+    if (message.includes('timeout')) {
+      return 'PROMPT_TIMEOUT';
+    }
+    if (message.includes('stream')) {
+      return 'STREAM_ERROR';
+    }
+    return 'PROMPT_FAILED';
+  }
 
   ipcMain.handle('acp:setMode', async (_event, { mode }: { mode: SupportedMode }) => {
     try {
