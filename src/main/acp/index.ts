@@ -11,7 +11,6 @@ export * from './types';
 export * from './interface';
 
 // Connection Implementations
-export { AcpConnection } from './connection';
 export { SdkClient } from './sdkClient';
 
 // Factory
@@ -19,5 +18,4 @@ export {
   ConnectionFactory,
   createDefaultConnection,
   createSdkConnection,
-  createAcpConnection,
 } from './connectionFactory';

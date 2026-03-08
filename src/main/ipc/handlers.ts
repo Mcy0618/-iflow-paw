@@ -10,7 +10,6 @@ import os from 'os';
 import { AcpConnection } from '../acp/connection';
 import { IConnection } from '../acp/interface';
 import { ConnectionFactory } from '../acp/connectionFactory';
-import { getProviderManager, ProviderManager } from '../providers/provider-manager';
 import { sessionStore, Session, Message } from '../store/sessions';
 import {
   SessionUpdate,
@@ -20,13 +19,9 @@ import {
   ToolCallData,
   CompleteData,
 } from '../acp/types';
-import {
-  ModelProvider,
-  ChatMessage,
-} from '../providers/types';
 
 // ============================================================================
-// Connection & Provider Instances
+// Connection Instances
 // ============================================================================
 
 // Unified connection (SDK or ACP) via ConnectionFactory
@@ -36,17 +31,14 @@ let connectionType: 'sdk' | 'acp' | null = null;
 // Legacy ACP connection reference (for type-specific operations)
 let acpConnection: AcpConnection | null = null;
 
-// Provider Manager for OpenAI-compatible APIs
-let providerManager: ProviderManager | null = null;
-
 // 保存 BrowserWindow 引用，用于在 IPC handler 中发送消息到渲染进程
 let mainWindowRef: BrowserWindow | null = null;
 
 let currentSessionId: string | null = null;
 let currentStreamingMessageId: string | null = null;
 
-// Connection mode: 'sdk' | 'acp' | 'provider'
-let connectionMode: 'sdk' | 'acp' | 'provider' = 'sdk';
+// Connection mode: 'sdk' | 'acp'
+let connectionMode: 'sdk' | 'acp' = 'sdk';
 
 // 防止并发连接竞争 - 关键修复
 let isConnecting = false;
@@ -119,13 +111,6 @@ function getConnection(): IConnection {
 }
 
 
-
-function getProviderMgr(): ProviderManager {
-  if (!providerManager) {
-    throw new Error('Provider manager not initialized');
-  }
-  return providerManager;
-}
 
 function notifyRenderer(channel: string, ...args: unknown[]): void {
   if (mainWindowRef && !mainWindowRef.isDestroyed()) {
@@ -334,9 +319,7 @@ export function registerIpcHandlers(window: BrowserWindow): void {
   // 保存 BrowserWindow 引用
   mainWindowRef = window;
   
-  // Initialize Provider Manager
-  providerManager = getProviderManager();
-  console.log('[IPC] ProviderManager initialized');
+  console.log('[IPC] IPC handlers registered');
 
   // ========================================================================
   // Connection Type Handlers
@@ -359,7 +342,7 @@ export function registerIpcHandlers(window: BrowserWindow): void {
     }
   });
 
-  ipcMain.handle('connection:setMode', async (_event, { mode }: { mode: 'acp' | 'provider' }) => {
+  ipcMain.handle('connection:setMode', async (_event, { mode }: { mode: 'acp' | 'sdk' }) => {
     try {
       connectionMode = mode;
       console.log('[IPC] Connection mode set to:', mode);
@@ -376,19 +359,13 @@ export function registerIpcHandlers(window: BrowserWindow): void {
   // ACP Connection Handlers
   // ========================================================================
 
-  ipcMain.handle('acp:connect', async (_event, { mode }: { mode?: 'sdk' | 'acp' | 'provider' }) => {
+  ipcMain.handle('acp:connect', async (_event, { mode }: { mode?: 'sdk' | 'acp' }) => {
     console.log('[Connection Handler] acp:connect called, mode:', mode, 'current connection:', !!connection, 'type:', connectionType, 'isConnecting:', isConnecting);
     
     // 更新全局连接模式
     if (mode) {
       connectionMode = mode;
       console.log('[Connection Handler] Connection mode set to:', mode);
-    }
-    
-    // Provider 模式不需要 ACP/SDK 连接
-    if (connectionMode === 'provider') {
-      console.log('[Connection Handler] Provider mode - no ACP/SDK connection needed');
-      return { success: true, connectionType: 'provider' };
     }
     
     // 关键修复：如果正在连接，复用现有的连接 Promise
@@ -431,7 +408,7 @@ export function registerIpcHandlers(window: BrowserWindow): void {
   });
   
   // 提取连接逻辑为独立函数
-  async function doConnect(mode: 'sdk' | 'acp' | 'provider' | undefined): Promise<{ success: boolean; connectionType?: string; alreadyConnected?: boolean; error?: string }> {
+  async function doConnect(mode: 'sdk' | 'acp' | undefined): Promise<{ success: boolean; connectionType?: string; alreadyConnected?: boolean; error?: string }> {
     console.log('[Connection Handler] doConnect started, mode:', mode);
     
     try {
@@ -776,6 +753,7 @@ export function registerIpcHandlers(window: BrowserWindow): void {
         
         // 触发重新连接（使用新的 workingDir）
         // 这里使用 setTimeout 延迟执行，确保断开完成
+        // 增加到 800ms 确保连接完全断开和端口释放
         setTimeout(async () => {
           try {
             const connectResult = await doConnect(connectionMode, null as any);
@@ -783,7 +761,7 @@ export function registerIpcHandlers(window: BrowserWindow): void {
           } catch (e) {
             console.error('[IPC] Failed to reconnect after workspace change:', e);
           }
-        }, 100);
+        }, 800);
       }
       
       return { success: true, data: { path } };
@@ -808,250 +786,6 @@ export function registerIpcHandlers(window: BrowserWindow): void {
         },
       };
     } catch (error) {
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : 'Unknown error',
-      };
-    }
-  });
-
-  // ========================================================================
-  // Provider Management Handlers
-  // ========================================================================
-
-  ipcMain.handle('provider:list', async () => {
-    try {
-      const mgr = getProviderMgr();
-      const providers = mgr.getAllProviders();
-      return { success: true, data: providers };
-    } catch (error) {
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : 'Unknown error',
-      };
-    }
-  });
-
-  ipcMain.handle('provider:getActive', async () => {
-    try {
-      const mgr = getProviderMgr();
-      const provider = mgr.getActiveProvider();
-      const model = mgr.getActiveModel();
-      return {
-        success: true,
-        data: {
-          provider,
-          model,
-        },
-      };
-    } catch (error) {
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : 'Unknown error',
-      };
-    }
-  });
-
-  ipcMain.handle('provider:setActive', async (_event, { providerId, modelId }: { providerId: string; modelId?: string }) => {
-    try {
-      const mgr = getProviderMgr();
-      await mgr.setActiveProvider(providerId);
-      if (modelId) {
-        mgr.setActiveModel(modelId);
-      }
-      return { success: true };
-    } catch (error) {
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : 'Unknown error',
-      };
-    }
-  });
-
-  ipcMain.handle('provider:setApiKey', async (_event, { providerId, apiKey }: { providerId: string; apiKey: string }) => {
-    try {
-      const mgr = getProviderMgr();
-      const success = mgr.setApiKey(providerId, apiKey);
-      return { success };
-    } catch (error) {
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : 'Unknown error',
-      };
-    }
-  });
-
-  ipcMain.handle('provider:setModel', async (_event, { modelId }: { modelId: string }) => {
-    try {
-      const mgr = getProviderMgr();
-      const success = mgr.setActiveModel(modelId);
-      return { success };
-    } catch (error) {
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : 'Unknown error',
-      };
-    }
-  });
-
-  ipcMain.handle('provider:add', async (_event, { provider }: { provider: ModelProvider }) => {
-    try {
-      const mgr = getProviderMgr();
-      const result = mgr.addProvider(provider);
-      return result;
-    } catch (error) {
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : 'Unknown error',
-      };
-    }
-  });
-
-  ipcMain.handle('provider:remove', async (_event, { providerId }: { providerId: string }) => {
-    try {
-      const mgr = getProviderMgr();
-      const success = mgr.removeProvider(providerId);
-      return { success };
-    } catch (error) {
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : 'Unknown error',
-      };
-    }
-  });
-
-  ipcMain.handle('provider:sync', async (_event, { providers, activeProviderId, activeModelId, apiKeys }: {
-    providers?: ModelProvider[];
-    activeProviderId?: string;
-    activeModelId?: string;
-    apiKeys?: Record<string, string>;
-  }) => {
-    try {
-      const mgr = getProviderMgr();
-      
-      // Import configuration
-      mgr.importConfig({
-        activeProviderId,
-        activeModelId,
-        customProviders: providers?.filter(p => !p.isPreset) || [],
-        apiKeys: apiKeys || {},
-      });
-
-      return { success: true };
-    } catch (error) {
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : 'Unknown error',
-      };
-    }
-  });
-
-  // ========================================================================
-  // Provider Chat Handler (Streaming)
-  // ========================================================================
-
-  ipcMain.handle('provider:sendPrompt', async (_event, { messages, options }: {
-    messages: ChatMessage[];
-    options?: {
-      model?: string;
-      temperature?: number;
-      maxTokens?: number;
-    };
-  }) => {
-    try {
-      if (!currentSessionId) {
-        throw new Error('No active session');
-      }
-
-      const mgr = getProviderMgr();
-      
-      // Create placeholder for assistant response
-      const assistantMessage = sessionStore.addMessage(currentSessionId, {
-        role: 'assistant',
-        content: '',
-        isStreaming: true,
-      });
-
-      let messageId: string | null = null;
-      if (assistantMessage) {
-        const lastMessage = assistantMessage.messages[assistantMessage.messages.length - 1];
-        messageId = lastMessage.id;
-        currentStreamingMessageId = messageId;
-      }
-
-      // Start streaming
-      const stream = mgr.chatStream(messages, options);
-      let fullContent = '';
-
-      for await (const chunk of stream) {
-        if (chunk.type === 'content' && chunk.content) {
-          fullContent += chunk.content;
-          
-          // Notify renderer of chunk
-          notifyRenderer('provider:chunk', {
-            messageId,
-            content: chunk.content,
-            fullContent,
-          });
-
-          // Update session store
-          if (messageId) {
-            sessionStore.updateMessage(currentSessionId, messageId, {
-              content: fullContent,
-            });
-          }
-        } else if (chunk.type === 'thought' && chunk.thought) {
-          // Notify renderer of thought
-          notifyRenderer('provider:thought', {
-            messageId,
-            thought: chunk.thought,
-          });
-        } else if (chunk.type === 'usage' && chunk.usage) {
-          // Notify renderer of usage
-          notifyRenderer('provider:usage', {
-            messageId,
-            usage: chunk.usage,
-          });
-        } else if (chunk.type === 'error') {
-          // Handle error
-          notifyRenderer('provider:error', {
-            messageId,
-            error: chunk.error,
-          });
-          
-          if (messageId) {
-            sessionStore.updateMessage(currentSessionId, messageId, {
-              isStreaming: false,
-              metadata: { finishReason: 'error' },
-            });
-          }
-          
-          currentStreamingMessageId = null;
-          return {
-            success: false,
-            error: chunk.error?.message || 'Unknown error',
-          };
-        } else if (chunk.type === 'done') {
-          // Streaming complete
-          notifyRenderer('provider:done', {
-            messageId,
-            finishReason: chunk.finishReason,
-          });
-
-          if (messageId) {
-            sessionStore.updateMessage(currentSessionId, messageId, {
-              isStreaming: false,
-              metadata: { finishReason: chunk.finishReason || 'stop' },
-            });
-          }
-          
-          currentStreamingMessageId = null;
-        }
-      }
-
-      return { success: true, data: { content: fullContent } };
-    } catch (error) {
-      currentStreamingMessageId = null;
       return {
         success: false,
         error: error instanceof Error ? error.message : 'Unknown error',
@@ -1441,15 +1175,6 @@ export function unregisterIpcHandlers(): void {
     'acp:setModel',
     'acp:setDeepThinking',
     'acp:getSettings',
-    'provider:list',
-    'provider:getActive',
-    'provider:setActive',
-    'provider:setApiKey',
-    'provider:setModel',
-    'provider:add',
-    'provider:remove',
-    'provider:sync',
-    'provider:sendPrompt',
     'session:list',
     'session:create',
     'session:load',
@@ -1481,12 +1206,6 @@ export function unregisterIpcHandlers(): void {
     connectionType = null;
   }
 
-  // Cleanup Provider Manager
-  if (providerManager) {
-    providerManager.destroy();
-    providerManager = null;
-  }
-  
   // 清除 BrowserWindow 引用
   mainWindowRef = null;
   

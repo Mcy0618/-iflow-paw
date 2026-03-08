@@ -1,15 +1,11 @@
 /**
  * Connection Factory - 连接工厂
  * 
- * 根据配置创建 SDK 或 ACP 连接，支持：
- * - 自动选择连接类型
- * - SDK 失败时自动降级到 ACP
- * - 连接状态持久化
+ * 根据配置创建 SDK 连接，仅支持 SDK 模式。
  */
 
-import { IConnection, ConnectionOptions, CONNECTION_TYPES } from './interface';
+import { IConnection, ConnectionOptions } from './interface';
 import { SdkClient } from './sdkClient';
-import { AcpConnection } from './connection';
 import { AcpConnectionState } from './types';
 
 // ============================================================================
@@ -18,8 +14,8 @@ import { AcpConnectionState } from './types';
 
 export interface ConnectionFactoryResult {
   connection: IConnection;
-  type: 'sdk' | 'acp';
-  fallback: boolean; // 是否发生降级
+  type: 'sdk';
+  fallback: boolean;
 }
 
 export interface ConnectionFactoryEvents {
@@ -35,13 +31,14 @@ export interface ConnectionFactoryEvents {
 export class ConnectionFactory {
   private static instance: ConnectionFactory | null = null;
   private currentConnection: IConnection | null = null;
-  private currentType: 'sdk' | 'acp' | null = null;
+  private currentType: 'sdk' | null = null;
+  private currentWorkingDir: string | null = null; // 跟踪当前工作目录
   private options: ConnectionOptions;
   
   // 防止并发创建连接
   private pendingConnection: Promise<ConnectionFactoryResult> | null = null;
 
-  private constructor(options: ConnectionOptions = { type: 'auto' }) {
+  private constructor(options: ConnectionOptions = { type: 'sdk' }) {
     this.options = options;
   }
 
@@ -76,16 +73,27 @@ export class ConnectionFactory {
    * - 'sdk': 强制使用 SDK，失败则抛出错误
    * - 'acp': 强制使用 ACP
    * - 'auto': 优先使用 SDK，失败时降级到 ACP
+   * 
+   * 如果请求的工作目录与当前不同，会断开旧连接并重建
    */
   async createConnection(options?: Partial<ConnectionOptions>): Promise<ConnectionFactoryResult> {
-    // 如果已有连接且已连接成功，直接返回
+    // 获取请求的工作目录
+    const requestedWorkingDir = options?.sdk?.workingDir || this.options.sdk?.workingDir || null;
+    
+    // 如果已有连接，检查工作目录是否变化
     if (this.currentConnection && this.currentConnection.isConnected) {
-      console.log('[ConnectionFactory] Reusing existing connection, type:', this.currentType);
-      return {
-        connection: this.currentConnection,
-        type: this.currentType!,
-        fallback: false,
-      };
+      // 工作目录变化时，强制断开并重建连接
+      if (requestedWorkingDir && this.currentWorkingDir !== requestedWorkingDir) {
+        console.log('[ConnectionFactory] Working directory changed from', this.currentWorkingDir, 'to', requestedWorkingDir, '- rebuilding connection');
+        await this.destroy();
+      } else {
+        console.log('[ConnectionFactory] Reusing existing connection, type:', this.currentType);
+        return {
+          connection: this.currentConnection,
+          type: this.currentType!,
+          fallback: false,
+        };
+      }
     }
     
     // 如果正在创建连接，等待它完成
@@ -99,6 +107,8 @@ export class ConnectionFactory {
     
     try {
       const result = await this.pendingConnection;
+      // 更新当前工作目录
+      this.currentWorkingDir = requestedWorkingDir;
       return result;
     } finally {
       this.pendingConnection = null;
@@ -118,17 +128,8 @@ export class ConnectionFactory {
       this.currentType = null;
     }
 
-    switch (mergedOptions.type) {
-      case CONNECTION_TYPES.SDK:
-        return this.createSdkConnection(mergedOptions);
-      
-      case CONNECTION_TYPES.ACP:
-        return this.createAcpConnection(mergedOptions);
-      
-      case CONNECTION_TYPES.AUTO:
-      default:
-        return this.createAutoConnection(mergedOptions);
-    }
+    // 仅支持 SDK 连接
+    return this.createSdkConnection(mergedOptions);
   }
 
   /**
@@ -157,68 +158,6 @@ export class ConnectionFactory {
     }
   }
 
-  /**
-   * 创建 ACP 连接
-   */
-  private async createAcpConnection(options: ConnectionOptions): Promise<ConnectionFactoryResult> {
-    console.log('[ConnectionFactory] Creating ACP connection...');
-    
-    const connection = new AcpConnection({
-      port: options.acp?.port,
-      host: options.acp?.host,
-    });
-    
-    try {
-      await connection.connect();
-      this.currentConnection = connection;
-      this.currentType = 'acp';
-      
-      console.log('[ConnectionFactory] ACP connection created successfully');
-      
-      return {
-        connection,
-        type: 'acp',
-        fallback: false,
-      };
-    } catch (error) {
-      console.error('[ConnectionFactory] ACP connection failed:', error);
-      throw error;
-    }
-  }
-
-  /**
-   * 自动创建连接（优先 SDK，降级 ACP）
-   */
-  private async createAutoConnection(options: ConnectionOptions): Promise<ConnectionFactoryResult> {
-    console.log('[ConnectionFactory] Creating auto connection (SDK with ACP fallback)...');
-    
-    // 尝试 SDK 连接
-    try {
-      const result = await this.createSdkConnection(options);
-      console.log('[ConnectionFactory] Auto connection resolved to SDK');
-      return result;
-    } catch (sdkError) {
-      console.warn('[ConnectionFactory] SDK connection failed, falling back to ACP:', sdkError);
-      
-      // 降级到 ACP
-      try {
-        const result = await this.createAcpConnection(options);
-        console.log('[ConnectionFactory] Auto connection resolved to ACP (fallback)');
-        
-        return {
-          ...result,
-          fallback: true,
-        };
-      } catch (acpError) {
-        console.error('[ConnectionFactory] Both SDK and ACP connections failed');
-        throw new Error(
-          `Connection failed: SDK error: ${sdkError instanceof Error ? sdkError.message : String(sdkError)}; ` +
-          `ACP error: ${acpError instanceof Error ? acpError.message : String(acpError)}`
-        );
-      }
-    }
-  }
-
   // ========================================================================
   // Connection Management
   // ========================================================================
@@ -233,7 +172,7 @@ export class ConnectionFactory {
   /**
    * 获取当前连接类型
    */
-  getCurrentType(): 'sdk' | 'acp' | null {
+  getCurrentType(): 'sdk' | null {
     return this.currentType;
   }
 
@@ -252,6 +191,13 @@ export class ConnectionFactory {
   }
 
   /**
+   * 获取当前工作目录
+   */
+  getCurrentWorkingDir(): string | null {
+    return this.currentWorkingDir;
+  }
+
+  /**
    * 断开并销毁连接
    */
   async destroy(): Promise<void> {
@@ -259,6 +205,7 @@ export class ConnectionFactory {
       await this.currentConnection.disconnect();
       this.currentConnection = null;
       this.currentType = null;
+      this.currentWorkingDir = null;
     }
   }
 
@@ -311,9 +258,9 @@ export class ConnectionFactory {
   /**
    * 获取推荐连接类型
    */
-  static async getRecommendedType(): Promise<'sdk' | 'acp'> {
-    const sdkAvailable = await ConnectionFactory.isSdkAvailable();
-    return sdkAvailable ? 'sdk' : 'acp';
+  static async getRecommendedType(): Promise<'sdk'> {
+    // 仅支持 SDK
+    return 'sdk';
   }
 }
 
@@ -322,10 +269,10 @@ export class ConnectionFactory {
 // ============================================================================
 
 /**
- * 创建默认连接（自动选择）
+ * 创建默认连接（SDK 模式）
  */
 export async function createDefaultConnection(): Promise<ConnectionFactoryResult> {
-  const factory = ConnectionFactory.getInstance({ type: 'auto' });
+  const factory = ConnectionFactory.getInstance({ type: 'sdk' });
   return factory.createConnection();
 }
 
@@ -334,14 +281,6 @@ export async function createDefaultConnection(): Promise<ConnectionFactoryResult
  */
 export async function createSdkConnection(sdkOptions?: ConnectionOptions['sdk']): Promise<ConnectionFactoryResult> {
   const factory = ConnectionFactory.getInstance({ type: 'sdk', sdk: sdkOptions });
-  return factory.createConnection();
-}
-
-/**
- * 创建 ACP 连接
- */
-export async function createAcpConnection(acpOptions?: ConnectionOptions['acp']): Promise<ConnectionFactoryResult> {
-  const factory = ConnectionFactory.getInstance({ type: 'acp', acp: acpOptions });
   return factory.createConnection();
 }
 

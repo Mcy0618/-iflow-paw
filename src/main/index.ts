@@ -2,7 +2,6 @@ import { app, shell, BrowserWindow, ipcMain, dialog } from 'electron'
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { registerIpcHandlers, unregisterIpcHandlers } from './ipc/handlers'
-import { getProviderManager, resetProviderManager } from './providers/provider-manager'
 
 // 保持窗口全局引用，防止被垃圾回收
 let mainWindow: BrowserWindow | null = null
@@ -144,13 +143,9 @@ app.whenReady().then(() => {
     return process.platform
   })
 
-  // Initialize Provider Manager
-  const providerManager = getProviderManager()
-  console.log('[Main] ProviderManager initialized:', providerManager.getActiveProvider()?.name || 'none')
-
   createWindow()
   
-  // 注册 ACP IPC handlers (Provider Manager will be used internally)
+  // 注册 ACP IPC handlers
   if (mainWindow) {
     registerIpcHandlers(mainWindow)
   }
@@ -174,8 +169,6 @@ app.on('before-quit', async () => {
   try {
     // 清理 IPC handlers 和 ACP 连接
     unregisterIpcHandlers()
-    // 清理 Provider Manager
-    resetProviderManager()
     console.log('[Main] Resources cleaned up successfully')
   } catch (error) {
     console.error('[Main] Error during cleanup:', error)

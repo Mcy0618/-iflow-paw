@@ -88,6 +88,7 @@ interface UseAcpReturn {
   reconnect: () => Promise<void>
   cancelReconnect: () => void
   processQueue: () => void
+  processPendingSync: () => Promise<void>
 }
 
 export function useAcp(): UseAcpReturn {
@@ -200,20 +201,27 @@ export function useAcp(): UseAcpReturn {
             const settingsResult = await api.acp.getSettings()
             if (settingsResult.success && settingsResult.data) {
               console.log('[ACP] Syncing settings from server after connect:', settingsResult.data)
+              
+              // [修复 4.3] 从 store 获取当前设置进行比较
+              const store = useAppStore.getState()
+              const currentDefaultModel = store.settings.defaultModel
+              const currentDefaultMode = store.settings.defaultMode
+              const currentDeepThinking = store.settings.deepThinking
+              
               // 同步模型设置
-              if (settingsResult.data.model && settingsResult.data.model !== currentModel) {
+              if (settingsResult.data.model && settingsResult.data.model !== currentDefaultModel) {
                 console.log('[ACP] Syncing model from server:', settingsResult.data.model)
                 setCurrentModel(settingsResult.data.model)
                 useAppStore.getState().updateSettings({ defaultModel: settingsResult.data.model })
               }
               // 同步模式设置
-              if (settingsResult.data.mode && settingsResult.data.mode !== currentMode) {
+              if (settingsResult.data.mode && settingsResult.data.mode !== currentDefaultMode) {
                 console.log('[ACP] Syncing mode from server:', settingsResult.data.mode)
                 setCurrentMode(settingsResult.data.mode)
                 useAppStore.getState().updateSettings({ defaultMode: settingsResult.data.mode })
               }
               // 同步深度思考设置
-              if (settingsResult.data.deepThinking !== undefined && settingsResult.data.deepThinking !== deepThinking) {
+              if (settingsResult.data.deepThinking !== undefined && settingsResult.data.deepThinking !== currentDeepThinking) {
                 console.log('[ACP] Syncing deepThinking from server:', settingsResult.data.deepThinking)
                 setDeepThinking(settingsResult.data.deepThinking)
                 useAppStore.getState().updateSettings({ deepThinking: settingsResult.data.deepThinking })
@@ -226,6 +234,9 @@ export function useAcp(): UseAcpReturn {
         
         // 连接成功后处理消息队列
         await processQueue()
+        
+        // [修复 4.2] 连接成功后处理待同步设置队列
+        await processPendingSync()
       } else {
         const errorInfo = classifyError(result.error || '连接失败')
         setConnectionError(errorInfo.message)
@@ -355,6 +366,68 @@ export function useAcp(): UseAcpReturn {
     }
   }, [addToast, removeFromMessageQueue])
 
+  // [修复 4.2] 处理待同步设置队列（在连接成功后调用）
+  const processPendingSync = useCallback(async () => {
+    const api = getElectronAPI()
+    if (!api) {
+      console.log('[PendingSync] No Electron API, skipping sync')
+      return
+    }
+
+    const store = useAppStore.getState()
+    const queue = store.pendingSyncQueue
+    
+    if (queue.length === 0) {
+      console.log('[PendingSync] Queue is empty, nothing to sync')
+      return
+    }
+
+    console.log(`[PendingSync] Processing ${queue.length} pending sync items`)
+    
+    // 逐个处理队列中的设置同步
+    for (const item of [...queue]) {
+      try {
+        let result: { success: boolean; error?: string } | undefined
+        
+        switch (item.type) {
+          case 'model':
+            result = await api.acp.setModel(item.value as string)
+            console.log('[PendingSync] Synced model:', item.value, result)
+            break
+          case 'mode':
+            result = await api.acp.setMode(item.value as string)
+            console.log('[PendingSync] Synced mode:', item.value, result)
+            break
+          case 'deepThinking':
+            result = await api.acp.setDeepThinking(item.value as boolean)
+            console.log('[PendingSync] Synced deepThinking:', item.value, result)
+            break
+          case 'workspace':
+            result = await api.acp.setWorkspace(item.value as string)
+            console.log('[PendingSync] Synced workspace:', item.value, result)
+            break
+          default:
+            console.warn('[PendingSync] Unknown sync type:', item.type)
+        }
+        
+        // 同步成功后从队列中移除
+        if (result?.success) {
+          useAppStore.getState().removeFromPendingSync(item.id)
+          addToast({ 
+            type: 'success', 
+            message: `设置已同步: ${item.type}`, 
+            duration: 2000 
+          })
+        } else {
+          console.error(`[PendingSync] Failed to sync ${item.type}:`, result?.error)
+        }
+      } catch (error) {
+        console.error(`[PendingSync] Error syncing ${item.type}:`, error)
+        break // 出错时停止处理，等待下次连接成功后再试
+      }
+    }
+  }, [addToast])
+
   // 重连（手动触发）
   const reconnect = useCallback(async () => {
     cancelReconnect()
@@ -385,10 +458,11 @@ export function useAcp(): UseAcpReturn {
     messages.push({ role: 'user', content })
 
     try {
-      // 关键修复：使用当前的 settings 和 state 值，而不是会话创建时的旧值
-      const effectiveModel = currentModel || session?.model || settings.defaultModel
-      const effectiveMode = currentMode || session?.mode || settings.defaultMode
-      const effectiveDeepThinking = deepThinking ?? session?.deepThinking ?? settings.deepThinking
+      // [修复 4.1] 从 store 获取最新的设置值，避免闭包捕获的过期状态
+      const store = useAppStore.getState()
+      const effectiveModel = store.settings.defaultModel
+      const effectiveMode = store.settings.defaultMode
+      const effectiveDeepThinking = store.settings.deepThinking
       
       console.log('[useAcp] Provider sendPrompt with:', { 
         model: effectiveModel, 
@@ -530,6 +604,18 @@ export function useAcp(): UseAcpReturn {
         return sendProviderMessage(content, sessionId, aiMessageId, api)
       }
 
+      // [修复 4.1] 从 store 获取最新的设置值，避免闭包捕获的过期状态
+      const store = useAppStore.getState()
+      const effectiveModel = store.settings.defaultModel
+      const effectiveMode = store.settings.defaultMode
+      const effectiveDeepThinking = store.settings.deepThinking
+      
+      console.log('[useAcp] Using settings from store:', { 
+        model: effectiveModel, 
+        mode: effectiveMode, 
+        deepThinking: effectiveDeepThinking 
+      })
+
       // SDK/ACP 模式 - 先加载会话到主进程（确保主进程有 currentSessionId）
       // 优先使用会话的 workingDir，这样切换工作区后能立即生效
       // 如果会话没有 workingDir，则使用全局设置
@@ -537,9 +623,9 @@ export function useAcp(): UseAcpReturn {
       console.log('[useAcp] Loading session with workingDir:', effectiveWorkingDir, 'session workingDir:', session.workingDir, 'settings:', settings.workspacePath)
       
       const loadResult = await api.session.load(sessionId, session.title, effectiveWorkingDir, {
-        model: currentModel,
-        mode: currentMode,
-        deepThinking: deepThinking,
+        model: effectiveModel,
+        mode: effectiveMode,
+        deepThinking: effectiveDeepThinking,
       })
       if (!loadResult.success) {
         const errorMsg = loadResult.error || '加载会话失败'
@@ -577,10 +663,16 @@ export function useAcp(): UseAcpReturn {
             
             // 重连后重试加载会话
             console.log('[useAcp] Retrying session load after reconnect...')
+            // [修复 4.1] 同样从 store 获取最新设置
+            const retryStore = useAppStore.getState()
+            const retryModel = retryStore.settings.defaultModel
+            const retryMode = retryStore.settings.defaultMode
+            const retryDeepThinking = retryStore.settings.deepThinking
+            
             const retryResult = await api.session.load(sessionId, session.title, effectiveWorkingDir, {
-              model: currentModel,
-              mode: currentMode,
-              deepThinking: deepThinking,
+              model: retryModel,
+              mode: retryMode,
+              deepThinking: retryDeepThinking,
             })
             
             if (!retryResult.success) {
@@ -1073,6 +1165,8 @@ export function useAcp(): UseAcpReturn {
         // 关键修复：等待状态完全同步后再继续
         setTimeout(() => {
           processQueue()
+          // [修复 4.2] 连接成功后处理待同步设置队列
+          processPendingSync()
         }, 100)
       } else if (status.status === 'disconnected') {
         setIsConnected(false)
@@ -1141,6 +1235,7 @@ export function useAcp(): UseAcpReturn {
     cancelReconnect,
     cancelStreaming,
     processQueue,
+    processPendingSync,
   }
 }
 
